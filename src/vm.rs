@@ -1,16 +1,15 @@
 //! the VM itself
 
-use std::num::NonZeroUsize;
+use std::{cmp::Ordering, num::NonZeroUsize};
 
-use crate::{parser::{self, PersistData}, types::*};
+use crate::{parser::{self, PersistData}, types::*, data::*};
 
-struct Memory {
-    segments: Vec<Box<[u8]>>,
-}
+const DT_SIZE_MAP: [VMType<'static>; 4] = [VMType::U8,VMType::U16,VMType::U32,VMType::U64];
 
-struct VMFlags {
-    pub const_lock: bool,
-    pub exited: bool,
+macro_rules! opt2err {
+    ($inner:expr) => {
+        opt2er($inner, VMError::from_owned(VMErrorClass::Other, format!("opt2err failure at {}:{}:{}", file!(), line!(), column!())))
+    };
 }
 
 /// a VM instance
@@ -19,7 +18,7 @@ struct VMFlags {
 /// - [Self::memory] MUST contain valid memory segments. In particular, the `code` segment MUST have been produced by the parser or in another way that guarantees the result is valid TTVM bytecode
 /// - [Self::regs] MUST be of length `Register::count()*8` initialized according to the TTVM spec
 pub struct TTVM<'a> {
-    memory: Vec<Box<[u8]>>,
+    memory: Memory,
     regs: Box<[u8]>,
     flags: VMFlags,
     persist: PersistData<'a>,
@@ -35,66 +34,679 @@ impl<'a> TTVM<'a> {
         let length = Register::count()*8;
         regs.reserve_exact(length);
         regs.resize(length, 0);
-        let mut memory = Vec::with_capacity(4);
-        memory.resize(4, Box::from([]));
+        let memory = unsafe { Memory::new_uninit() };
         Self { memory, regs: regs.into_boxed_slice(), flags: VMFlags::new(), persist }
     }
     pub fn from_object_file(file: &'a [u8], stack_size: Option<NonZeroUsize>) -> VMResult<Self> {
         let (object_data, persist) = parser::ObjectData::from_object_file(file)?;
         let mut raw = unsafe {Self::new_uninit(persist)};
         // load bytecode
-        raw.memory[VM_CODE] = object_data.get_code()?;
+        unsafe { raw.memory.set_segment(VM_CODE, object_data.get_code()?) };
         // load datavars
-        raw.memory[VM_DATA] = object_data.get_data()?;
+        unsafe { raw.memory.set_segment(VM_DATA, object_data.get_data()?) };
         // create invariant segment
         let invar_size = object_data.get_invar_count()*4;
         let mut invar = Vec::new();
         invar.reserve_exact(invar_size);
         invar.resize(invar_size, 0);
-        raw.memory[VM_INVAR] = invar.into_boxed_slice();
+        unsafe { raw.memory.set_segment(VM_INVAR, invar.into_boxed_slice()) };
         // create stack
         let mut stack = Vec::new();
         let size = unsafe {stack_size.unwrap_or(NonZeroUsize::new(4096).unwrap_unchecked()).get()};
         stack.reserve_exact(size);
         stack.resize(size, 0);
-        raw.memory[VM_STACK] = stack.into_boxed_slice();
+        unsafe { raw.memory.set_segment(VM_STACK, stack.into_boxed_slice()) };
         // initialize the constant registers
         raw.flags.const_lock = false;
-        raw.write_reg(Register::R13, VMValue(VMType::U64, &([0xff;8][..])))?;
-        raw.write_reg(Register::R14, VMValue(VMType::U8, &([0xff][..])))?;
-        raw.write_reg(Register::INVAR, VMValue(VMType::PTR(Box::new(VMType::VOID)), &((raw.memory[0].len() as u32).to_be_bytes()[..])))?;
-        raw.write_reg(Register::DATA, VMValue(VMType::PTR(Box::new(VMType::VOID)), &(((raw.memory[0].len()+raw.memory[1].len()) as u32).to_be_bytes()[..])))?;
+        raw.write_reg(Register::R13, CValue::U64(0xffffffffffffffff))?;
+        raw.write_reg(Register::R14, CValue::U8(1))?;
+        raw.write_reg(Register::INVAR, CValue::U32(raw.memory.offset_of(VM_INVAR) as u32))?;
+        raw.write_reg(Register::DATA, CValue::U32(raw.memory.offset_of(VM_DATA) as u32))?;
         raw.flags.const_lock = true;
+        raw.write_reg(Register::SP, CValue::U64(size as u64))?;
+        raw.memory.set_perm(Memory::S_CODE, Memory::P_EXEC|Memory::P_READ);
+        raw.memory.set_perm(Memory::S_INVAR, Memory::P_READ|Memory::P_WRITE);
+        raw.memory.set_perm(Memory::S_DATA, Memory::P_READ|Memory::P_WRITE);
+        raw.memory.set_perm(Memory::S_STACK, Memory::P_READ|Memory::P_WRITE);
         Ok(raw)
     }
 }
 
-impl VMFlags {
-    pub fn new() -> Self {
-        Self { const_lock: true, exited: false }
+impl<'a> TTVM<'a> {
+    pub fn purpose(&self) -> VMPurpose {
+        return self.persist.purpose;
+    }
+    pub fn name(&'a self) -> &'a str {
+        return &self.persist.name;
+    }
+    pub fn fstr(&'a self) -> &'a str {
+        return &self.persist.fstr;
+    }
+    pub fn some_flags(&self) -> u16 {
+        return self.persist.some;
+    }
+    pub fn none_flags(&self) -> u16 {
+        return self.persist.none;
+    }
+}
+
+impl<'a> TTVM<'a> {
+    fn write_reg(&mut self, register: Register, value: CValue) -> VMResult<()> {
+        let offset = register as usize * 8;
+        if self.flags.const_lock && register.is_cvr() {
+            return Err(etodo!());
+        }
+        let size = value.sizeof();
+        // println!("{register:?}");
+        (&mut self.regs[offset..offset+8]).fill(0);
+        value.copy_into(&mut self.regs[offset+8-size..offset+8]);
+        return Ok(());
+    }
+    fn read_reg(&'a self, register: Register, rtype: VMType<'a>) -> VMResult<CValue> {
+        let offset = register as usize * 8;
+        if let Some(size) = rtype.sizeof() {
+            if let Some(cv) = CValue::from_parts(rtype, &self.regs[offset+8-size..offset+8]) {
+                return Ok(cv);
+            }
+        }
+        Err(etodo!())
+    }
+
+    /// reads an argument register
+    fn read_arg_reg(&self, nf: &mut bool, pc: &mut usize, cb: &mut u8, mods: &InstMods) -> VMResult<Register> {
+        *cb = self.memory.get(*pc)?;
+        if mods.era {
+            *nf = false;
+            *pc += 1;
+            return Ok(Register::from_byte(*cb));
+        } else {
+            if *nf {
+                *pc += 1;
+            }
+            *nf = !*nf;
+            return Ok(Register::from_byte(if *nf {*cb>>4} else {*cb&0x0f}));
+        }
+    }
+    fn read_arg_nybble(&self, nf: &mut bool, pc: &mut usize, cb: &mut u8) -> VMResult<u8> {
+        *cb = self.memory.get(*pc)?;
+        if *nf {
+            *pc += 1;
+        }
+        *nf = !*nf;
+        return Ok(if *nf {*cb>>4} else {*cb&0x0f});
+    }
+    fn read_inline_value(&self, length: u8, pc: &mut usize, dtype: VMType) -> VMResult<CValue> {
+        if dtype.sizeof().is_none() {
+            return Err(etodo!());
+        }
+        let count = 1<<(length as usize);
+        let bytes = self.memory.get_range(*pc, count)?;
+        *pc += count;
+        let mut vbytes = [0u8;8];
+        if dtype.signed() && bytes[0] & 0x80 != 0 {
+            (&mut vbytes[0..8-count]).fill(0xff);
+        }
+        (&mut vbytes[8-count..8]).copy_from_slice(bytes);
+        // println!("{dtype} = {count} < {length}");
+        // at this point, vbytes now contains a 64 bit value equal to whatever the inline value was
+        let r = dtype.sizeof().unwrap();
+        // println!("{r}");
+        let op = CValue::from_parts(dtype, &vbytes[8-r..8]);
+        // println!("{:?}", &op);
+        opt2err!(op)
+    }
+
+    fn push_value(&mut self, value: CValue) -> VMResult<()> {
+        let ss = value.sizeof() as u64;
+        if ss > 8 {
+            return Err(etodo!());
+        }
+        let nsp = match self.read_reg(Register::SP, VMType::U64)?{CValue::U64(v)=>v,_=>unreachable!()} - ss;
+        self.write_reg(Register::SP, CValue::U64(nsp))?;
+        self.memory.write_checked(nsp as usize, &value.as_bytes())?;
+        Ok(())
+    }
+    fn pop_value(&mut self, size: usize) -> VMResult<CValue> {
+        if size > 3 {
+            return Err(etodo!());
+        }
+        let readt = &DT_SIZE_MAP[size];
+        let ss = 1 << size;
+        let csp = match self.read_reg(Register::SP, VMType::U64)?{CValue::U64(v)=>v,_=>unreachable!()};
+        let rval = opt2err!(CValue::from_parts(readt.clone(), self.memory.read_checked(csp as usize, ss as usize)?))?;
+        self.write_reg(Register::SP, CValue::U64(csp + ss))?;
+        Ok(rval)
+    }
+    fn push_subr(&mut self, reg: Register, size: usize) -> VMResult<()> {
+        if size > 3 {
+            return Err(etodo!());
+        }
+        let readt = &DT_SIZE_MAP[size];
+        let ss = 1 << size;
+        let nsp = match self.read_reg(Register::SP, VMType::U64)?{CValue::U64(v)=>v,_=>unreachable!()} - ss;
+        self.write_reg(Register::SP, CValue::U64(nsp))?;
+        let rval = self.read_reg(reg, readt.clone())?;
+        self.write_reg(reg, CValue::U8(0))?;
+        self.memory.write_checked(nsp as usize, &rval.as_bytes())?;
+        Ok(())
+    }
+    fn pop_subr(&mut self, reg: Register, size: usize) -> VMResult<()> {
+        if size > 3 {
+            return Err(etodo!());
+        }
+        let readt = &DT_SIZE_MAP[size];
+        let ss = 1 << size;
+        let csp = match self.read_reg(Register::SP, VMType::U64)?{CValue::U64(v)=>v,_=>unreachable!()};
+        let rval = opt2err!(CValue::from_parts(readt.clone(), self.memory.read_checked(csp as usize, ss as usize)?))?;
+        self.write_reg(Register::SP, CValue::U64(csp + ss))?;
+        self.write_reg(reg, rval)?;
+        Ok(())
+    }
+
+    /// executes a single instruction
+    fn execute_instruction_impl(&mut self) -> VMResult<VMAction> {
+        let mut pc = match self.read_reg(Register::PC, VMType::U64)? {CValue::U64(v)=>v,_=>unreachable!()} as usize;
+        if self.memory.get_perms_at(pc)? & Memory::P_EXEC == 0 {
+            return Err(vmerror!(format!("attempt to execute from non-executable memory (address {pc:#010x})")));
+        }
+        self.memory.lock_seg(pc)?;
+        let mut mods = InstMods::new();
+        let mut cb = self.memory.get(pc)?;
+        let mut nf = false; // which nybble to use when reading arguments
+        let mut ract = VMAction::NOP;
+        while cb & 0x40 != 0 {
+            if cb == 0x44 {
+                mods.era = true;
+            } else if cb == 0x45 {
+                mods.call = true;
+            } else if cb == 0x46 {
+                mods.oprev = true;
+            } else if cb == 0x50 {
+                mods.sign = true;
+            } else if cb == 0x51 {
+                mods.fpop = true;
+            } else if cb & 0xfc == 0x40 {
+                mods.size = cb & 3;
+            } else if cb & 0xf8 == 0x48 {
+                mods.memoffset[0] = cb & 7;
+                if mods.memoffset[0] == 1 {
+                    pc += 1;
+                    cb = self.memory.get(pc)?;
+                    if cb & 0xc0 != 0x40 {
+                        return Err(etodo!());
+                    }
+                    mods.memoffset[1] = cb & 0x3f;
+                }
+            } else {
+                // invalid modifier
+                return Err(etodo!());
+            }
+            pc += 1;
+            cb = self.memory.get(pc)?;
+        }
+        let opcode = cb;
+        let _dbgass_pc = pc;
+        pc += 1;
+        let vt = match mods.size {
+            0 => VMType::U8,
+            1 => VMType::U16,
+            2 => VMType::U32,
+            3 => VMType::U64,
+            _ => unreachable!()
+        };
+        match opcode {
+            // all of these take r/re,r/re arguments
+            0|3|6|12|15|16|17|18|21|24|29|32|43|46 => {
+                let rx = self.read_arg_reg(&mut nf, &mut pc, &mut cb, &mods)?;
+                let ry = self.read_arg_reg(&mut nf, &mut pc, &mut cb, &mods)?;
+                // both of these should pass if two registers were just read
+                debug_assert!(nf==false);
+                debug_assert!(_dbgass_pc+2==pc||(mods.era&&_dbgass_pc+3==pc));
+                match opcode {
+                    // these all do an operation of the form f(rx,ry)->rx
+                    0|3|6|15|16|17|18|21|24 => {
+                        if !self.reg_write_allowed(rx) {
+                            return Err(etodo!());
+                        }
+                        let mut xv;
+                        let yv;
+                        if opcode <= 6 && mods.fpop {
+                            if mods.size < 2 {
+                                return Err(etodo!());
+                            }
+                            return Err(vmerror!("todo", "fp arith operations"));
+                        } else if opcode == 6 && mods.sign {
+                            xv = self.read_reg(rx, opt2err!(vt.to_signed())?)?;
+                            yv = self.read_reg(ry, opt2err!(vt.to_signed())?)?;
+                        } else {
+                            xv = self.read_reg(rx, vt.clone())?;
+                            yv = self.read_reg(ry, vt.clone())?;
+                        }
+                        match opcode {
+                            0 => {xv = xv.add(yv)?;}
+                            3 => {xv = xv.sub(yv)?;}
+                            6 => {xv = xv.mul(yv)?;}
+                            15 => {xv = xv.shl(yv)?;}
+                            16 => {xv = xv.shr(yv)?;}
+                            17 => {xv = xv.sar(yv)?;}
+                            18 => {xv = xv.xor(yv)?;}
+                            21 => {xv = xv.or(yv)?;}
+                            24 => {xv = xv.and(yv)?;}
+                            _ => {unreachable!()}
+                        }
+                        self.write_reg(rx, xv)?;
+                    }
+                    12 => {
+                        let xv;
+                        let yv;
+                        if mods.fpop {
+                            return Err(vmerror!("todo", "fp div"));
+                        } else if mods.sign {
+                            xv = self.read_reg(rx, opt2err!(vt.to_signed())?)?;
+                            yv = self.read_reg(ry, opt2err!(vt.to_signed())?)?;
+                        } else {
+                            xv = self.read_reg(rx, vt.clone())?;
+                            yv = self.read_reg(ry, vt.clone())?;
+                        }
+                        let (q, r) = xv.div(yv)?;
+                        self.push_value(q)?;
+                        self.push_value(r)?;
+                    }
+                    29 => {
+                        let xv;
+                        let yv;
+                        if mods.fpop {
+                            return Err(etodo!());
+                        } else {
+                            xv = self.read_reg(rx, vt.clone())?;
+                            yv = self.read_reg(ry, vt.clone())?;
+                        }
+                        self.cmp_subr(xv, yv)?;
+                    }
+                    32 => {
+                        if !(self.reg_write_allowed(rx) && self.reg_write_allowed(ry)) {
+                            return Err(etodo!());
+                        }
+                        let xv = self.read_reg(rx, vt.clone())?;
+                        let yv = self.read_reg(ry, vt.clone())?;
+                        self.write_reg(rx, yv)?;
+                        self.write_reg(ry, xv)?;
+                    }
+                    43 => {
+                        if !self.reg_write_allowed(rx) {
+                            return Err(etodo!());
+                        }
+                        if mods.oprev {
+                            return Err(etodo!());
+                        }
+                        let yv;
+                        if mods.fpop {
+                            return Err(vmerror!("todo", "fp moves"));
+                        } else {
+                            yv = self.read_reg(ry, vt.clone())?;
+                        }
+                        self.write_reg(rx, yv)?;
+                    }
+                    46 => {
+                        let mut yv = match self.read_reg(ry, VMType::U64)?{CValue::U64(v)=>v,_=>unreachable!()} as usize;
+                        match mods.memoffset[0] {
+                            0 => {}
+                            1 => {yv += self.read_reg(Register::from_byte(mods.memoffset[1]), VMType::U64)?.u64() as usize;}
+                            3 => {yv += self.read_reg(Register::DATA, VMType::U64)?.u64() as usize;}
+                            4 => {yv += self.read_reg(Register::INVAR, VMType::U64)?.u64() as usize;}
+                            _ => {return Err(etodo!());}
+                        }
+                        if mods.oprev {
+                            let xv = self.read_reg(rx, vt.clone())?;
+                            self.memory.write_checked(yv, &xv.as_bytes())?;
+                        } else {
+                            if !self.reg_write_allowed(rx) {
+                                return Err(etodo!());
+                            }
+                            if mods.fpop {
+                                return Err(vmerror!("todo", "fp moves"));
+                            }
+                            let mv = opt2err!(CValue::from_parts(vt.clone(), self.memory.read_checked(yv, vt.sizeof().unwrap())?))?;
+                            self.write_reg(rx, mv)?;
+                        }
+                    }
+                    _ => {unreachable!()}
+                }
+            }
+            // all of these take r/re,m operands
+            1|4|7|13|19|22|25|30|44 => {
+                // println!("NF: {nf} PC: {pc}");
+                let rx = self.read_arg_reg(&mut nf, &mut pc, &mut cb, &mods)?;
+                // println!("NF: {nf} PC: {pc} RX: {rx:?}");
+                nf = true;
+                let mut mz = {
+                    let ms = self.read_arg_nybble(&mut nf, &mut pc, &mut cb)?;
+                    // println!("NF: {nf} PC: {pc} MS: {ms} CB: {cb:#04x}");
+                    self.read_inline_value(ms, &mut pc, match mods.memoffset[0] {
+                        0 => vt.clone(),
+                        _ => vt.to_signed().unwrap()
+                    })?
+                };
+                match mods.memoffset[0] {
+                    0 => {}
+                    1|3|4 => {
+                        let base;
+                        if mods.memoffset[0] == 1 {
+                            base = self.read_reg(Register::from_byte(mods.memoffset[1]), VMType::S64)?;
+                        } else if mods.memoffset[0] == 3 {
+                            base = self.read_reg(Register::DATA, VMType::S64)?;
+                        } else {
+                            base = self.read_reg(Register::INVAR, VMType::S64)?;
+                        }
+                        mz = mz.promote_width(&base).add(base)?.as_unsigned()?;
+                    }
+                    _ => {return Err(etodo!());}
+                }
+                match opcode {
+                    // all of the form f(rx,mz)->rx
+                    1|4|7|19|22|25 => {
+                        if !self.reg_write_allowed(rx) {
+                            return Err(etodo!());
+                        }
+                        let mut xv;
+                        let mv;
+                        if opcode <= 7 && mods.fpop {
+                            if mods.size < 2 {
+                                return Err(etodo!());
+                            }
+                            return Err(vmerror!("todo", "fp arith ops"));
+                        } else if opcode == 7 && mods.sign {
+                            return Err(vmerror!("todo", "signed mul"));
+                        } else {
+                            xv = self.read_reg(rx, vt.clone())?;
+                            mv = opt2err!(CValue::from_parts(vt.clone(), self.memory.read_checked(mz.u64() as usize, vt.sizeof().unwrap())?))?;
+                        }
+                        match opcode {
+                            1 => {xv = xv.add(mv)?;}
+                            4 => {xv = xv.sub(mv)?;}
+                            7 => {xv = xv.mul(mv)?;}
+                            19 => {xv = xv.xor(mv)?;}
+                            22 => {xv = xv.or(mv)?;}
+                            25 => {xv = xv.and(mv)?;}
+                            _ => {unreachable!()}
+                        }
+                        self.write_reg(rx, xv)?;
+                    }
+                    13 => {
+                        let xv;
+                        let mv;
+                        if mods.fpop {
+                            return Err(vmerror!("todo", "fp div"));
+                        } else if mods.sign {
+                            xv = self.read_reg(rx, opt2err!(vt.to_signed())?)?;
+                            mv = opt2err!(CValue::from_parts(vt.to_signed().unwrap(), self.memory.read_checked(mz.u64() as usize, vt.sizeof().unwrap())?))?;
+                        } else {
+                            xv = self.read_reg(rx, vt.clone())?;
+                            mv = opt2err!(CValue::from_parts(vt.clone(), self.memory.read_checked(mz.u64() as usize, vt.sizeof().unwrap())?))?;
+                        }
+                        let (q, r) = xv.div(mv)?;
+                        self.push_value(q)?;
+                        self.push_value(r)?;
+                    }
+                    30 => {
+                        let xv;
+                        let mv;
+                        if mods.fpop {
+                            return Err(etodo!());
+                        } else {
+                            xv = self.read_reg(rx, vt.clone())?;
+                            mv = opt2err!(CValue::from_parts(vt.clone(), self.memory.read_checked(mz.u64() as usize, vt.sizeof().unwrap())?))?;
+                        }
+                        self.cmp_subr(xv, mv)?;
+                    }
+                    44 => {
+                        if mods.oprev {
+                            let xv = self.read_reg(rx, vt.clone())?;
+                            self.memory.write_checked(mz.u64() as usize, &xv.as_bytes())?;
+                        } else {
+                            if !self.reg_write_allowed(rx) {
+                                return Err(etodo!());
+                            }
+                            if mods.fpop {
+                                return Err(vmerror!("todo", "fp moves"));
+                            }
+                            let mv = opt2err!(CValue::from_parts(vt.clone(), self.memory.read_checked(mz.u64() as usize, vt.sizeof().unwrap())?))?;
+                            self.write_reg(rx, mv)?;
+                        }
+                    }
+                    _ => {unreachable!()}
+                }
+            }
+            // all of these take r/re,i operands
+            2|5|8|14|20|23|26|31|45 => {
+                let rx = self.read_arg_reg(&mut nf, &mut pc, &mut cb, &mods)?;
+                nf = true;
+                let iv = {
+                    let is = self.read_arg_nybble(&mut nf, &mut pc, &mut cb)?;
+                    self.read_inline_value(is, &mut pc, vt.clone())?
+                };
+                match opcode {
+                    // all of the form f(rx,iz)->rx
+                    2|5|8|20|23|26 => {
+                        if !self.reg_write_allowed(rx) {
+                            return Err(etodo!());
+                        }
+                        let mut xv;
+                        if opcode <= 7 && mods.fpop {
+                            if mods.size < 2 {
+                                return Err(etodo!());
+                            }
+                            return Err(vmerror!("todo", "fp arith ops"));
+                        } else if opcode == 7 && mods.sign {
+                            return Err(vmerror!("todo", "signed mul"));
+                        } else {
+                            xv = self.read_reg(rx, vt.clone())?;
+                        }
+                        match opcode {
+                            1 => {xv = xv.add(iv)?;}
+                            4 => {xv = xv.sub(iv)?;}
+                            7 => {xv = xv.mul(iv)?;}
+                            19 => {xv = xv.xor(iv)?;}
+                            22 => {xv = xv.or(iv)?;}
+                            25 => {xv = xv.and(iv)?;}
+                            _ => {unreachable!()}
+                        }
+                        self.write_reg(rx, xv)?;
+                    }
+                    14 => {
+                        let xv;
+                        if mods.fpop {
+                            return Err(vmerror!("todo", "fp div"));
+                        } else if mods.sign {
+                            xv = self.read_reg(rx, opt2err!(vt.to_signed())?)?;
+                        } else {
+                            xv = self.read_reg(rx, vt.clone())?;
+                        }
+                        let (q, r) = xv.div(iv)?;
+                        self.push_value(q)?;
+                        self.push_value(r)?;
+                    }
+                    31 => {
+                        let xv;
+                        if mods.fpop {
+                            return Err(etodo!());
+                        } else {
+                            xv = self.read_reg(rx, vt.clone())?;
+                        }
+                        self.cmp_subr(xv, iv)?;
+                    }
+                    45 => {
+                        if !self.reg_write_allowed(rx) {
+                            return Err(etodo!());
+                        }
+                        if mods.oprev {
+                            return Err(etodo!());
+                        }
+                        if mods.fpop {
+                            return Err(vmerror!("todo", "fp moves"));
+                        }
+                        self.write_reg(rx, iv)?;
+                    }
+                    _ => {unreachable!()}
+                }
+            }
+            27 => {
+                mods.era = true;
+                let rx = self.read_arg_reg(&mut nf, &mut pc, &mut cb, &mods)?;
+                self.push_subr(rx, mods.size as usize)?;
+            }
+            28 => {
+                mods.era = true;
+                let rx = self.read_arg_reg(&mut nf, &mut pc, &mut cb, &mods)?;
+                self.pop_subr(rx, mods.size as usize)?;
+            }
+            // syscall
+            42 => {
+                match self.read_reg(Register::R0, VMType::U64)?.u64() {
+                    6 => {
+                        ract = VMAction::STOP;
+                    }
+                    _ => {return Err(etodo!());}
+                }
+            }
+            63 => {return Err(VMError::from_owned(VMErrorClass::Halt, format!("HLT at address {:#010x}", pc-1)));}
+            11 => {
+                cb = self.memory.get(pc)?;
+                pc += 1;
+                if !self.flags.ignore_breaks {
+                    let mut ndbg = true;
+                    if self.flags.debug_breaks {
+                        ndbg = false;
+                        match cb {
+                            201 => {
+                                println!("00: {:?}", self.ext_read_reg(Register::R0, VMType::U64)?);
+                                println!("01: {:?}", self.ext_read_reg(Register::R1, VMType::U64)?);
+                                println!("02: {:?}", self.ext_read_reg(Register::R2, VMType::U64)?);
+                                println!("03: {:?}", self.ext_read_reg(Register::R3, VMType::U64)?);
+                                println!("04: {:?}", self.ext_read_reg(Register::R4, VMType::U64)?);
+                            }
+                            202 => {
+                                println!("IV: {:?}", self.ext_read_reg(Register::INVAR, VMType::U64)?);
+                            }
+                            _ => {ndbg = true;}
+                        }
+                    }
+                    if ndbg {
+                        println!("BRK {cb}");
+                        return Err(etodo!());
+                    }
+                }
+            }
+            // invalid opcode
+            _ => {return Err(VMError::from_owned(VMErrorClass::Invalid, format!("invalid opcode: {opcode:#04x}")));}
+        }
+        self.write_reg(Register::PC, CValue::U64(pc as u64))?;
+        Ok(ract)
+    }
+    /// converts underlying errors into [VMAction::ABORT] instances
+    fn execute_instruction(&mut self) -> VMAction {
+        let res = self.execute_instruction_impl();
+        self.memory.unlock_seg();
+        match res {
+            Ok(v) => v,
+            Err(e) => VMAction::ABORT(e)
+        }
+    }
+
+    /// begins execution at the specified symbol
+    pub fn execute(&mut self, symbol: &str, params: &Vec<VMValue>, rtype: VMType) -> VMResult<VMValue> {
+        for (i, p) in params.iter().take(4).enumerate() {
+            if p.0.sizeof().is_none() {
+                return Err(vmerror!("todo", "non-concrete params"));
+            }
+            self.write_reg(Register::from_byte(i as u8 + 1), opt2err!(CValue::from_parts(p.0.clone(), &p.1))?)?;
+        }
+        for p in params.iter().skip(4) {
+            if p.0.sizeof().is_none() {
+                return Err(vmerror!("todo", "non-concrete params"));
+            }
+            self.push_value(opt2err!(CValue::from_parts(p.0.clone(), &p.1))?)?;
+        }
+        self.write_reg(Register::PC, CValue::U64(opt2err!(self.persist.index.get(symbol))?.offset as u64))?;
+        let mut count = 0usize;
+        self.flags.exited = false;
+        loop {
+            if count > 100 {
+                return Err(vmerror!("todo", "count exceeded"));
+            }
+            count += 1;
+            match self.execute_instruction() {
+                VMAction::NOP => {},
+                VMAction::ABORT(e) => {return Err(e);},
+                VMAction::STOP => {self.flags.exited = true;break;}
+            }
+        }
+        if self.flags.exited && match rtype {VMType::VOID=>false,_=>true} {
+            if rtype.sizeof().is_some() {
+                return Ok(self.read_reg(Register::R1, rtype.clone())?.decompose())
+            }
+            return Err(vmerror!("todo", "non-conrete return types"));
+        }
+        Ok(VMValue(VMType::VOID, Box::from([])))
     }
 }
 
 impl TTVM<'_> {
-    fn write_mem(&mut self, addr: usize, value: VMValue) -> VMResult<()> {
-        if let Some(size) = value.0.sizeof() {
-            let src = value.1;
-            (&mut self.regs[addr..addr+size]).clone_from_slice(src);
-            return Ok(());
-        }
-        Err(VMError::DEFAULT)
+    fn cmp_subr(&mut self, xv: CValue, yv: CValue) -> VMResult<()> {
+        let (uord, sord) = xv.cmp(yv)?;
+        let mut cfv = 0;
+        cfv |= match uord {
+            Ordering::Equal => FlagBit::CF_Z,
+            Ordering::Greater => FlagBit::CF_A,
+            Ordering::Less => FlagBit::CF_B,
+        };
+        cfv |= match sord {
+            Ordering::Equal => FlagBit::CF_Z,
+            Ordering::Greater => FlagBit::CF_G,
+            Ordering::Less => FlagBit::CF_L,
+        };
+        self.write_reg(Register::CF, CValue::U64(cfv))?;
+        Ok(())
     }
-    fn write_reg(&mut self, register: Register, value: VMValue) -> VMResult<()> {
-        let offset = register as usize * 8;
-        if register.is_cvr() {
-            return Err(VMError::DEFAULT);
-        }
-        if let Some(size) = value.0.sizeof() {
-            (&mut self.regs[offset..offset+8]).fill(0);
-            let src = value.1;
-            (&mut self.regs[offset+8-size..offset+8]).clone_from_slice(src);
-            return Ok(());
-        }
-        Err(VMError::DEFAULT)
+    fn reg_write_allowed(&self, reg: Register) -> bool {
+        return self.flags.priv_mode || !reg.is_ror();
+    }
+}
+
+fn opt2er<T>(o: Option<T>, e: VMError) -> VMResult<T> {
+    match o {
+        Some(v) => Ok(v),
+        None => Err(e)
+    }
+}
+
+
+
+/// all of these methods directly alter the internal state of the TTVM without regard for its invariants
+/// do not use these unless you are familiar with the specific TTVM implementation
+impl TTVM<'_> {
+    pub fn ext_write_reg(&mut self, register: Register, value: CValue) -> VMResult<()> {
+        self.write_reg(register, value)
+    }
+    pub fn ext_read_reg(&self, register: Register, rtype: VMType) -> VMResult<CValue> {
+        self.read_reg(register, rtype)
+    }
+    pub fn ext_mem(&mut self) -> &mut Memory {
+        return &mut self.memory;
+    }
+    pub fn ext_flags(&mut self) -> &mut VMFlags {
+        return &mut self.flags;
+    }
+    pub fn ext_pushr(&mut self, reg: Register, size: usize) -> VMResult<()> {
+        self.push_subr(reg, size)
+    }
+    pub fn ext_popr(&mut self, reg: Register, size: usize) -> VMResult<()> {
+        self.pop_subr(reg, size)
+    }
+    pub fn ext_pushv(&mut self, value: CValue) -> VMResult<()> {
+        self.push_value(value)
+    }
+    pub fn ext_popv(&mut self, size: usize) -> VMResult<CValue> {
+        self.pop_value(size)
     }
 }

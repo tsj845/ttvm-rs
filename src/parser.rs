@@ -40,7 +40,7 @@ impl Display for VMIndexEntry<'_> {
 }
 
 #[derive(Clone)]
-pub struct PersistData<'a> {
+pub(crate) struct PersistData<'a> {
     pub fstr: String,
     pub some: u16,
     pub none: u16,
@@ -62,7 +62,7 @@ enum DataVar<'a> {
     RES(u16),
 }
 
-pub struct ObjectData<'a> {
+pub(crate) struct ObjectData<'a> {
     fileref: &'a [u8],
     sections: [(usize,usize);4],
     invars: usize,
