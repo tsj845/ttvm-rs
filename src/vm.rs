@@ -663,7 +663,7 @@ impl<'a> TTVM<'a> {
                         }
                     }
                 }
-                let daddr = dst.u64();
+                // let daddr = dst.u64();
                 // println!("OPCODE: {opcode:#010b} PC: {_dbgass_pc:#010x} CALL: {} JF: {jf:#06b} DST: {:#010x}", mods.call, daddr);
                 // println!("DBYTE: {:#04x}", self.memory[daddr as usize]);
                 let s = jf & 1 != 0;
