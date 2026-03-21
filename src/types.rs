@@ -319,7 +319,7 @@ impl Register {
 }
 
 /// concrete value
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq)]
 pub enum CValue {
     U8(u8),S8(i8),
     U16(u16),S16(i16),

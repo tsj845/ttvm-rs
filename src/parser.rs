@@ -1,12 +1,12 @@
 //! handles parsing TTVM object files
 
-use std::{collections::HashMap, fmt::{Debug, Display}, str};
+use std::{fmt::{Debug, Display}, str};
 
 use crate::types::*;
 
 #[derive(Clone)]
 pub struct VMIndexEntry<'a> {
-    name: String,
+    pub name: String,
     pub offset: usize,
     pub params: Box<[(VMType<'a>,String)]>,
     pub rtype: VMType<'a>,
@@ -46,7 +46,7 @@ pub(crate) struct PersistData<'a> {
     pub none: u16,
     pub purpose: VMPurpose,
     pub name: String,
-    pub index: HashMap<String, VMIndexEntry<'a>>,
+    pub index: Vec<VMIndexEntry<'a>>,
 }
 
 impl Debug for PersistData<'_> {
@@ -87,7 +87,7 @@ impl<'a> ObjectData<'a> {
         let mut p_some: u16 = 0;let mut p_none: u16 = 0;
         let mut p_name: String = "".to_string();let mut p_fstr: String = "".to_string();
         let mut datavars = Vec::new();
-        let mut index = HashMap::new();
+        let mut index = Vec::new();
         while i < l {
             if file[i..i+7].eq("SECTION".as_bytes()) {
                 i += 7;
@@ -187,7 +187,7 @@ impl<'a> ObjectData<'a> {
                                 rtype = read_type(file, &mut i)?;
                             }
                         }
-                        index.insert(ename.clone(), VMIndexEntry { name: ename, offset: offset as usize, params: std::iter::zip(ptl, pnl).collect::<Vec<_>>().into_boxed_slice(), rtype });
+                        index.push(VMIndexEntry { name: ename, offset: offset as usize, params: std::iter::zip(ptl, pnl).collect::<Vec<_>>().into_boxed_slice(), rtype });
                     }
                     continue;
                 }

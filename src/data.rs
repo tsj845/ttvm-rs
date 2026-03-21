@@ -1,6 +1,6 @@
 //! definitions of internal VM datastructures
 
-use std::{num::NonZeroU8, ops::Index};
+use std::{fs, io, num::NonZeroU8, ops::Index};
 
 use crate::types::*;
 
@@ -9,14 +9,18 @@ impl FlagBit {
     pub const CF_Z: u64 = 1;
     pub const CF_L: u64 = 2;
     pub const CF_B: u64 = 4;
-    pub const CF_G: u64 = 8;
-    pub const CF_A: u64 = 16;
 }
 
 pub struct Memory {
     t_length: usize,
     segments: Vec<(Box<[u8]>, u8)>,
     seg_lock: Option<NonZeroU8>,
+}
+
+impl Memory {
+    pub fn dump(&self, s: &str) -> io::Result<()> {
+        fs::write(s, &self.segments[0].0)
+    }
 }
 
 impl Memory {
@@ -208,5 +212,37 @@ pub(crate) struct InstMods {
 impl InstMods {
     pub fn new() -> Self {
         Self { era: false, call: false, oprev: false, sign: false, fpop: false, size: 2, memoffset: [0,0] }
+    }
+}
+
+#[non_exhaustive]
+#[derive(Debug, Clone, Copy)]
+pub enum VMCondition {
+    EX,
+    NE,
+    BX,
+    BE,
+    LX,
+    LE,
+    AX,
+    AE,
+    GX,
+    GE,
+}
+
+impl VMCondition {
+    pub fn check(self, flags: u64) -> bool {
+        match self {
+            Self::EX => flags & FlagBit::CF_Z != 0,
+            Self::NE => flags & FlagBit::CF_Z == 0,
+            Self::BX => flags & FlagBit::CF_B != 0,
+            Self::BE => flags & (FlagBit::CF_B | FlagBit::CF_Z) != 0,
+            Self::LX => flags & FlagBit::CF_L != 0,
+            Self::LE => flags & (FlagBit::CF_L | FlagBit::CF_Z) != 0,
+            Self::AX => flags & (FlagBit::CF_B | FlagBit::CF_Z) == 0,
+            Self::AE => flags & FlagBit::CF_B == 0,
+            Self::GX => flags & (FlagBit::CF_L | FlagBit::CF_Z) == 0,
+            Self::GE => flags & FlagBit::CF_L == 0,
+        }
     }
 }

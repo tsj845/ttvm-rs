@@ -6,9 +6,11 @@ use ttvm_rs::types::VMResult;
 fn main() -> VMResult<()> {
     let filedata = fs::read("rs_test.ttvm").unwrap();
     let mut vm = TTVM::from_object_file(&filedata[..], None)?;
+    let _ = vm.ext_mem().dump("mem_dump.bin");
     vm.ext_write_reg(Register::R1, CValue::U32(5))?;
     vm.ext_write_reg(Register::R2, CValue::U32(5))?;
     println!("{:?}", vm.execute("@constructor", &Vec::new(), VMType::VOID));
+    println!("{:?}", vm.execute("@getrequiredbits", &vec![CValue::U32(8).decompose()], VMType::U8));
     // println!("{:?}", vm.ext_read_reg(Register::R0, VMType::U64)?);
     // println!("{:?}", vm.ext_read_reg(Register::R1, VMType::U64)?);
     // println!("{:?}", vm.ext_read_reg(Register::R2, VMType::U64)?);

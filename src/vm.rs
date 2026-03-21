@@ -22,6 +22,7 @@ pub struct TTVM<'a> {
     regs: Box<[u8]>,
     flags: VMFlags,
     persist: PersistData<'a>,
+    stack_size: u64,
 }
 
 impl<'a> TTVM<'a> {
@@ -35,7 +36,7 @@ impl<'a> TTVM<'a> {
         regs.reserve_exact(length);
         regs.resize(length, 0);
         let memory = unsafe { Memory::new_uninit() };
-        Self { memory, regs: regs.into_boxed_slice(), flags: VMFlags::new(), persist }
+        Self { memory, regs: regs.into_boxed_slice(), flags: VMFlags::new(), persist, stack_size: 0 }
     }
     pub fn from_object_file(file: &'a [u8], stack_size: Option<NonZeroUsize>) -> VMResult<Self> {
         let (object_data, persist) = parser::ObjectData::from_object_file(file)?;
@@ -53,6 +54,7 @@ impl<'a> TTVM<'a> {
         // create stack
         let mut stack = Vec::new();
         let size = unsafe {stack_size.unwrap_or(NonZeroUsize::new(4096).unwrap_unchecked()).get()};
+        raw.stack_size = size as u64;
         stack.reserve_exact(size);
         stack.resize(size, 0);
         unsafe { raw.memory.set_segment(VM_STACK, stack.into_boxed_slice()) };
@@ -69,6 +71,9 @@ impl<'a> TTVM<'a> {
         raw.memory.set_perm(Memory::S_DATA, Memory::P_READ|Memory::P_WRITE);
         raw.memory.set_perm(Memory::S_STACK, Memory::P_READ|Memory::P_WRITE);
         Ok(raw)
+    }
+    fn reset_stack_pointer(&mut self) -> VMResult<()> {
+        self.write_reg(Register::SP, CValue::U64(self.stack_size))
     }
 }
 
@@ -383,8 +388,8 @@ impl<'a> TTVM<'a> {
                     let ms = self.read_arg_nybble(&mut nf, &mut pc, &mut cb)?;
                     // println!("NF: {nf} PC: {pc} MS: {ms} CB: {cb:#04x}");
                     self.read_inline_value(ms, &mut pc, match mods.memoffset[0] {
-                        0 => vt.clone(),
-                        _ => vt.to_signed().unwrap()
+                        0 => VMType::U64,
+                        _ => VMType::S64
                     })?
                 };
                 match mods.memoffset[0] {
@@ -398,7 +403,7 @@ impl<'a> TTVM<'a> {
                         } else {
                             base = self.read_reg(Register::INVAR, VMType::S64)?;
                         }
-                        mz = mz.promote_width(&base).add(base)?.as_unsigned()?;
+                        mz = mz.add(base)?.as_unsigned()?;
                     }
                     _ => {return Err(etodo!());}
                 }
@@ -503,12 +508,12 @@ impl<'a> TTVM<'a> {
                             xv = self.read_reg(rx, vt.clone())?;
                         }
                         match opcode {
-                            1 => {xv = xv.add(iv)?;}
-                            4 => {xv = xv.sub(iv)?;}
-                            7 => {xv = xv.mul(iv)?;}
-                            19 => {xv = xv.xor(iv)?;}
-                            22 => {xv = xv.or(iv)?;}
-                            25 => {xv = xv.and(iv)?;}
+                            2 => {xv = xv.add(iv)?;}
+                            5 => {xv = xv.sub(iv)?;}
+                            8 => {xv = xv.mul(iv)?;}
+                            20 => {xv = xv.xor(iv)?;}
+                            23 => {xv = xv.or(iv)?;}
+                            26 => {xv = xv.and(iv)?;}
                             _ => {unreachable!()}
                         }
                         self.write_reg(rx, xv)?;
@@ -550,6 +555,44 @@ impl<'a> TTVM<'a> {
                     _ => {unreachable!()}
                 }
             }
+            33 => {
+                let rx = Register::from_byte(self.memory.get(pc)?);
+                pc += 1;
+                let ry = self.read_arg_reg(&mut nf, &mut pc, &mut cb, &mods)?;
+                nf = true;
+                let sizes = self.read_arg_nybble(&mut nf, &mut pc, &mut cb)?;
+                let mut mw = self.read_inline_value(sizes>>2, &mut pc, match mods.memoffset[0] {
+                    0 => VMType::U64,
+                    _ => VMType::S64
+                })?;
+                let mut mz = self.read_inline_value(sizes&3, &mut pc, match mods.memoffset[0] {
+                    0 => VMType::U64,
+                    _ => VMType::S64
+                })?;
+                match mods.memoffset[0] {
+                    0 => {}
+                    1|3|4 => {
+                        let base;
+                        if mods.memoffset[0] == 1 {
+                            base = self.read_reg(Register::from_byte(mods.memoffset[1]), VMType::S64)?;
+                        } else if mods.memoffset[0] == 3 {
+                            base = self.read_reg(Register::DATA, VMType::S64)?;
+                        } else {
+                            base = self.read_reg(Register::INVAR, VMType::S64)?;
+                        }
+                        mw = mw.add(base)?.as_unsigned()?;
+                        mz = mz.add(base)?.as_unsigned()?;
+                    }
+                    _ => {return Err(etodo!());}
+                }
+                let xv = self.read_reg(rx, vt.clone())?;
+                let yv = self.read_reg(ry, vt.clone())?;
+                let wv = opt2err!(CValue::from_parts(vt.clone(), self.memory.read_checked(mw.u64() as usize, vt.sizeof().unwrap())?))?;
+                self.cmp_subr(xv, wv)?;
+                if VMCondition::EX.check(self.read_reg(Register::CF, VMType::U64)?.u64()) {
+                    self.memory.write_checked(mz.u64() as usize, &yv.as_bytes())?;
+                }
+            }
             27 => {
                 mods.era = true;
                 let rx = self.read_arg_reg(&mut nf, &mut pc, &mut cb, &mods)?;
@@ -567,6 +610,80 @@ impl<'a> TTVM<'a> {
                         ract = VMAction::STOP;
                     }
                     _ => {return Err(etodo!());}
+                }
+            }
+            // ret
+            41 => {
+                let raddr = self.pop_value(8)?;
+                self.write_reg(Register::PC, raddr)?;
+            }
+            // jmp/jcc
+            34|35|36|37|38|39|40 => {
+                let rx = Register::from_byte(self.read_arg_nybble(&mut nf, &mut pc, &mut cb)?);
+                let jf = self.read_arg_nybble(&mut nf, &mut pc, &mut cb)?;
+                let dst;
+                if mods.call {
+                    if jf & 4 != 0 {
+                        if jf & 2 != 0 {
+                            if jf & 8 == 0 {
+                                dst = self.read_inline_value(2, &mut pc, VMType::U64)?;
+                            } else {
+                                dst = self.read_inline_value(1, &mut pc, VMType::U64)?;
+                            }
+                        } else {
+                            dst = CValue::U64(opt2err!(self.persist.index.get(self.read_inline_value(1, &mut pc, VMType::U64)?.u64() as usize))?.offset as u64);
+                        }
+                    } else {
+                        if jf & 2 != 0 {
+                            dst = self.read_reg(rx, VMType::U64)?;
+                        } else {
+                            dst = CValue::U64(opt2err!(self.persist.index.get(self.read_reg(rx, VMType::U64)?.u64() as usize))?.offset as u64);
+                        }
+                    }
+                } else {
+                    if jf & 4 != 0 {
+                        let rf;
+                        if jf & 2 != 0 {
+                            rf = self.read_inline_value(2, &mut pc, VMType::U64)?;
+                        } else {
+                            // println!("READING VALUE AT: {pc:#010x}");
+                            rf = self.read_inline_value(1, &mut pc, VMType::U64)?;
+                            // println!("NEW PC: {pc:#010x}");
+                        }
+                        if jf & 8 != 0 {
+                            dst = CValue::S64(pc as i64).add(rf.as_signed()?)?.as_unsigned()?;
+                        } else {
+                            dst = rf;
+                        }
+                    } else {
+                        if jf & 8 != 0 {
+                            dst = CValue::S64(pc as i64).add(self.read_reg(rx, VMType::S64)?)?.as_unsigned()?;
+                        } else {
+                            dst = self.read_reg(rx, VMType::U64)?;
+                        }
+                    }
+                }
+                let daddr = dst.u64();
+                // println!("OPCODE: {opcode:#010b} PC: {_dbgass_pc:#010x} CALL: {} JF: {jf:#06b} DST: {:#010x}", mods.call, daddr);
+                // println!("DBYTE: {:#04x}", self.memory[daddr as usize]);
+                let s = jf & 1 != 0;
+                let proceed = match opcode {
+                    34 => true,
+                    _ => match opcode {
+                        35 => VMCondition::EX,
+                        36 => VMCondition::NE,
+                        37 => if s {VMCondition::BX} else {VMCondition::LX}
+                        38 => if s {VMCondition::BE} else {VMCondition::LE}
+                        39 => if s {VMCondition::AX} else {VMCondition::GX}
+                        40 => if s {VMCondition::AE} else {VMCondition::GE}
+                        _ => unreachable!()
+                    }.check(self.read_reg(Register::CF, VMType::U64)?.u64())
+                };
+                if proceed {
+                    if mods.call {
+                        self.push_value(CValue::U64(pc as u64))?;
+                    }
+                    pc = dst.u64() as usize;
                 }
             }
             63 => {return Err(VMError::from_owned(VMErrorClass::Halt, format!("HLT at address {:#010x}", pc-1)));}
@@ -615,6 +732,7 @@ impl<'a> TTVM<'a> {
 
     /// begins execution at the specified symbol
     pub fn execute(&mut self, symbol: &str, params: &Vec<VMValue>, rtype: VMType) -> VMResult<VMValue> {
+        self.reset_stack_pointer()?;
         for (i, p) in params.iter().take(4).enumerate() {
             if p.0.sizeof().is_none() {
                 return Err(vmerror!("todo", "non-concrete params"));
@@ -627,7 +745,7 @@ impl<'a> TTVM<'a> {
             }
             self.push_value(opt2err!(CValue::from_parts(p.0.clone(), &p.1))?)?;
         }
-        self.write_reg(Register::PC, CValue::U64(opt2err!(self.persist.index.get(symbol))?.offset as u64))?;
+        self.write_reg(Register::PC, CValue::U64(opt2err!(self.persist.index.iter().find(|x|x.name==symbol))?.offset as u64))?;
         let mut count = 0usize;
         self.flags.exited = false;
         loop {
@@ -657,13 +775,13 @@ impl TTVM<'_> {
         let mut cfv = 0;
         cfv |= match uord {
             Ordering::Equal => FlagBit::CF_Z,
-            Ordering::Greater => FlagBit::CF_A,
             Ordering::Less => FlagBit::CF_B,
+            _ => 0,
         };
         cfv |= match sord {
             Ordering::Equal => FlagBit::CF_Z,
-            Ordering::Greater => FlagBit::CF_G,
             Ordering::Less => FlagBit::CF_L,
+            _ => 0,
         };
         self.write_reg(Register::CF, CValue::U64(cfv))?;
         Ok(())
@@ -708,5 +826,8 @@ impl TTVM<'_> {
     }
     pub fn ext_popv(&mut self, size: usize) -> VMResult<CValue> {
         self.pop_value(size)
+    }
+    pub fn ext_reset_stack_pointer(&mut self) -> VMResult<()> {
+        self.reset_stack_pointer()
     }
 }
