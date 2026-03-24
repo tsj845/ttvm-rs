@@ -116,11 +116,13 @@ impl<'a> ObjectData<'a> {
                 }
                 2 => {
                     let sl = u16::from_be_bytes(file[i..i+2].try_into().unwrap()) as usize;
+                    // println!("SL: {sl}");
                     p_fstr = String::from_utf8_lossy(&file[i+2..i+2+sl]).to_string();i += 2 + sl;
                     let dc = u16::from_be_bytes(file[i..i+2].try_into().unwrap()) as usize;
                     datavars.reserve_exact(dc);i += 2;
                     for _ in 0..dc {
-                        datavars.push(match file[i] {
+                        i += 1;
+                        datavars.push(match file[i-1] {
                             0 => {i+=4;DataVar::S32(i32::from_be_bytes(file[i-4..i].try_into().unwrap()))}
                             1 => {let sl=file[i]as usize;i += 1 + sl;DataVar::STR(unsafe{str::from_utf8_unchecked(&file[i-sl..i])})}
                             2 => {i+=8;DataVar::F64(f64::from_be_bytes(file[i-8..i].try_into().unwrap()))}
@@ -128,6 +130,7 @@ impl<'a> ObjectData<'a> {
                             _ => {return Err(VMError::new(VMErrorClass::Invalid, "invalid datavar type id"));}
                         })
                     }
+                    // println!("{i:#010x}");
                     continue;
                 }
                 3 => {

@@ -386,7 +386,7 @@ impl<'a> TTVM<'a> {
                 nf = true;
                 let mut mz = {
                     let ms = self.read_arg_nybble(&mut nf, &mut pc, &mut cb)?;
-                    // println!("NF: {nf} PC: {pc} MS: {ms} CB: {cb:#04x}");
+                    // println!("NF: {nf} PC: {_dbgass_pc:#010x} MS: {ms} CB: {cb:#04x} OP: {opcode}");
                     self.read_inline_value(ms, &mut pc, match mods.memoffset[0] {
                         0 => VMType::U64,
                         _ => VMType::S64
@@ -488,8 +488,10 @@ impl<'a> TTVM<'a> {
                 nf = true;
                 let iv = {
                     let is = self.read_arg_nybble(&mut nf, &mut pc, &mut cb)?;
+                    // println!("NF: {nf} PC: {_dbgass_pc:#010x} IS: {is} CB: {cb:#04x} OP: {opcode}");
                     self.read_inline_value(is, &mut pc, vt.clone())?
                 };
+                // println!("NPC: {pc:#010x}");
                 match opcode {
                     // all of the form f(rx,iz)->rx
                     2|5|8|20|23|26 => {
@@ -701,6 +703,14 @@ impl<'a> TTVM<'a> {
                                 println!("02: {:?}", self.ext_read_reg(Register::R2, VMType::U64)?);
                                 println!("03: {:?}", self.ext_read_reg(Register::R3, VMType::U64)?);
                                 println!("04: {:?}", self.ext_read_reg(Register::R4, VMType::U64)?);
+                                println!("05: {:?}", self.ext_read_reg(Register::R5, VMType::U64)?);
+                                println!("06: {:?}", self.ext_read_reg(Register::R6, VMType::U64)?);
+                                println!("07: {:?}", self.ext_read_reg(Register::R7, VMType::U64)?);
+                                println!("08: {:?}", self.ext_read_reg(Register::R8, VMType::U64)?);
+                                println!("09: {:?}", self.ext_read_reg(Register::R9, VMType::U64)?);
+                                println!("10: {:?}", self.ext_read_reg(Register::R10, VMType::U64)?);
+                                println!("11: {:?}", self.ext_read_reg(Register::R11, VMType::U64)?);
+                                println!("12: {:?}", self.ext_read_reg(Register::R12, VMType::U64)?);
                             }
                             202 => {
                                 println!("IV: {:?}", self.ext_read_reg(Register::INVAR, VMType::U64)?);
@@ -710,12 +720,14 @@ impl<'a> TTVM<'a> {
                     }
                     if ndbg {
                         println!("BRK {cb}");
-                        return Err(etodo!());
+                        if self.flags.halt_breaks {
+                            return Err(etodo!());
+                        }
                     }
                 }
             }
             // invalid opcode
-            _ => {return Err(VMError::from_owned(VMErrorClass::Invalid, format!("invalid opcode: {opcode:#04x}")));}
+            _ => {return Err(VMError::from_owned(VMErrorClass::Invalid, format!("invalid opcode: {opcode:#04x} @ {_dbgass_pc:#010x}")));}
         }
         self.write_reg(Register::PC, CValue::U64(pc as u64))?;
         Ok(ract)
@@ -732,6 +744,7 @@ impl<'a> TTVM<'a> {
 
     /// begins execution at the specified symbol
     pub fn execute(&mut self, symbol: &str, params: &Vec<VMValue>, rtype: VMType) -> VMResult<VMValue> {
+        // println!("EXECUTING {symbol}");
         self.reset_stack_pointer()?;
         for (i, p) in params.iter().take(4).enumerate() {
             if p.0.sizeof().is_none() {
@@ -745,7 +758,9 @@ impl<'a> TTVM<'a> {
             }
             self.push_value(opt2err!(CValue::from_parts(p.0.clone(), &p.1))?)?;
         }
-        self.write_reg(Register::PC, CValue::U64(opt2err!(self.persist.index.iter().find(|x|x.name==symbol))?.offset as u64))?;
+        let pcv = opt2err!(self.persist.index.iter().find(|x|x.name==symbol))?.offset as u64;
+        // println!("SYM @ {pcv:#010x}");
+        self.write_reg(Register::PC, CValue::U64(pcv))?;
         let mut count = 0usize;
         self.flags.exited = false;
         loop {

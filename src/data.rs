@@ -157,6 +157,46 @@ impl Memory {
     pub fn unlock_seg(&mut self) -> () {
         self.seg_lock = None;
     }
+    fn read_tarray(&self, offset: usize, length: usize, itype: &VMType) -> VMResult<VArr> {
+        Ok(match itype {
+            VMType::U16 => {
+                let mut a = make_array(length);
+                for i in 0..length {
+                    a[i] = u16::from_be_bytes(self.get_range(offset+(i*2), 2)?.try_into().unwrap());
+                }
+                VArr::U16(a)
+            }
+            VMType::U32 => {
+                let mut a = make_array(length);
+                for i in 0..length {
+                    a[i] = u32::from_be_bytes(self.get_range(offset+(i*4), 4)?.try_into().unwrap());
+                }
+                VArr::U32(a)
+            }
+            _ => {return Err(etodo!());}
+        })
+    }
+    pub fn read_avalue<'a>(&self, offset: usize, rtype: VMType<'a>) -> VMResult<AValue<'a>> {
+        match &rtype {
+            VMType::SSTR => {
+                todo!()
+            }
+            VMType::LSTR => {
+                todo!()
+            }
+            VMType::SARR(c, t) => {
+                let a = self.read_tarray(offset, *c as usize, t)?;
+                return Ok(AValue::ARR(*t.clone(), a));
+            }
+            VMType::UARR(t) => {
+                let l = self.get(offset)? as usize;
+                let a = self.read_tarray(offset+1, l, t)?;
+                return Ok(AValue::ARR(*t.clone(), a));
+            }
+            VMType::TSTRUCT(_) => {return Err(vmerror!("todo", "tstruct reads"));}
+            _ => {return Err(etodo!());}
+        }
+    }
 }
 impl Index<usize> for Memory {
     type Output = u8;
@@ -174,6 +214,12 @@ impl Index<usize> for Memory {
     }
 }
 
+fn make_array<T: Default + Clone>(l: usize) -> Box<[T]> {
+    let mut a = Vec::new();
+    a.resize(l, T::default());
+    return a.into_boxed_slice();
+}
+
 pub struct VMFlags {
     /// whether to lock constant registers
     pub const_lock: bool,
@@ -185,11 +231,13 @@ pub struct VMFlags {
     pub debug_breaks: bool,
     /// whether to ignore all BRK instructions
     pub ignore_breaks: bool,
+    /// whether to halt on BRK instructions
+    pub halt_breaks: bool,
 }
 
 impl VMFlags {
     pub fn new() -> Self {
-        Self { const_lock: true, exited: false, priv_mode: false, debug_breaks: false, ignore_breaks: true }
+        Self { const_lock: true, exited: false, priv_mode: false, debug_breaks: false, ignore_breaks: true, halt_breaks: true }
     }
 }
 

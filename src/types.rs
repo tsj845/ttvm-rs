@@ -784,3 +784,33 @@ impl CValue {
         }
     }
 }
+
+
+#[non_exhaustive]
+#[derive(Debug, Clone)]
+pub enum AValue<'a> {
+    PTR(VMType<'a>, CValue),
+    SSTR(String),
+    LSTR(String),
+    ARR(VMType<'a>, VArr),
+    #[non_exhaustive]
+    TSTRUCT(())
+}
+
+#[derive(Debug, Clone)]
+pub enum VArr {
+    U8(Box<[u8]>),
+    S8(Box<[i8]>),
+    U16(Box<[u16]>),
+    S16(Box<[i16]>),
+    PTR(Box<[u32]>),
+    U32(Box<[u32]>),
+    S32(Box<[i32]>),
+    U64(Box<[u64]>),
+    S64(Box<[i64]>),
+    U128(Box<[u128]>),
+    S128(Box<[i128]>),
+    F32(Box<[f32]>),
+    F64(Box<[f64]>),
+}
+
