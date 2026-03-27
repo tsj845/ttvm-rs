@@ -26,38 +26,34 @@ pub struct TTVM<'a> {
 }
 
 impl<'a> TTVM<'a> {
-    /// creates a new uninitialized VM instance
-    /// this function is unsafe because it leaves the VM in an invalid state
-    /// this function does not leave the VM as an invalid bit representation
-    /// this function does not leave the VM in a state that would cause UB
-    unsafe fn new_uninit(persist: PersistData<'a>) -> Self {
+    fn new_uninit(persist: PersistData<'a>) -> Self {
         let mut regs = Vec::new();
         let length = Register::count()*8;
         regs.reserve_exact(length);
         regs.resize(length, 0);
-        let memory = unsafe { Memory::new_uninit() };
+        let memory = Memory::new_uninit();
         Self { memory, regs: regs.into_boxed_slice(), flags: VMFlags::new(), persist, stack_size: 0 }
     }
     pub fn from_object_file(file: &'a [u8], stack_size: Option<NonZeroUsize>) -> VMResult<Self> {
         let (object_data, persist) = parser::ObjectData::from_object_file(file)?;
-        let mut raw = unsafe {Self::new_uninit(persist)};
+        let mut raw = Self::new_uninit(persist);
         // load bytecode
-        unsafe { raw.memory.set_segment(VM_CODE, object_data.get_code()?) };
+        raw.memory.set_segment(VM_CODE, object_data.get_code()?);
         // load datavars
-        unsafe { raw.memory.set_segment(VM_DATA, object_data.get_data()?) };
+        raw.memory.set_segment(VM_DATA, object_data.get_data()?);
         // create invariant segment
         let invar_size = object_data.get_invar_count()*4;
         let mut invar = Vec::new();
         invar.reserve_exact(invar_size);
         invar.resize(invar_size, 0);
-        unsafe { raw.memory.set_segment(VM_INVAR, invar.into_boxed_slice()) };
+        raw.memory.set_segment(VM_INVAR, invar.into_boxed_slice());
         // create stack
         let mut stack = Vec::new();
         let size = unsafe {stack_size.unwrap_or(NonZeroUsize::new(4096).unwrap_unchecked()).get()};
         raw.stack_size = size as u64;
         stack.reserve_exact(size);
         stack.resize(size, 0);
-        unsafe { raw.memory.set_segment(VM_STACK, stack.into_boxed_slice()) };
+        raw.memory.set_segment(VM_STACK, stack.into_boxed_slice());
         // initialize the constant registers
         raw.flags.const_lock = false;
         raw.write_reg(Register::R13, CValue::U64(0xffffffffffffffff))?;

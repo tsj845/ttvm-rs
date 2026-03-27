@@ -33,13 +33,13 @@ impl Memory {
     pub const S_DATA: usize = 2;
     pub const S_STACK: usize = 3;
 
-    pub unsafe fn new_uninit() -> Self {
+    pub fn new_uninit() -> Self {
         let mut segments = Vec::new();
         segments.reserve_exact(4);
         segments.resize(4, (Box::from([]), 0));
         Self { t_length: 0, segments, seg_lock: None }
     }
-    pub unsafe fn set_segment(&mut self, segment: usize, data: Box<[u8]>) -> () {
+    pub fn set_segment(&mut self, segment: usize, data: Box<[u8]>) -> () {
         self.t_length -= self.segments[segment].0.len();
         self.t_length += data.len();
         self.segments[segment].0 = data;
