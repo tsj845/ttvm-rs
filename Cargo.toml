@@ -2,5 +2,8 @@
 name = "ttvm-rs"
 version = "0.1.0"
 edition = "2021"
+repository = "https://github.com/tsj845/ttvm-rs"
+license = "Unlicense"
+license-file = "UNLICENSE"
 
 [dependencies]
