@@ -12,11 +12,6 @@ macro_rules! opt2err {
     };
 }
 
-/// a VM instance
-/// 
-/// INVARIANTS:
-/// - [Self::memory] MUST contain valid memory segments. In particular, the `code` segment MUST have been produced by the parser or in another way that guarantees the result is valid TTVM bytecode
-/// - [Self::regs] MUST be of length `Register::count()*8` initialized according to the TTVM spec
 pub struct TTVM<'a> {
     memory: Memory,
     regs: Box<[u8]>,

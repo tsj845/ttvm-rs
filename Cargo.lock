@@ -3,5 +3,5 @@
 version = 4
 
 [[package]]
-name = "ttvm-rs"
+name = "ttvm"
 version = "0.1.0"

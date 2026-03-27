@@ -1,8 +1,16 @@
 [package]
-name = "ttvm-rs"
+name = "ttvm"
 version = "0.1.0"
 edition = "2021"
 repository = "https://github.com/tsj845/ttvm-rs"
 license-file = "UNLICENSE"
+
+authors = [
+    "Tristan Schartman <tristan.schartman@territopple.net>"
+]
+
+exclude = [
+    "src/main.rs"
+]
 
 [dependencies]

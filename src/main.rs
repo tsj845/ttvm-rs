@@ -1,8 +1,8 @@
 use std::env::args;
 use std::fs;
 
-use ttvm_rs::prelude::*;
-use ttvm_rs::types::VMResult;
+use ttvm::prelude::*;
+use ttvm::types::VMResult;
 
 fn main() -> VMResult<()> {
     let filedata = fs::read("rs_test.ttvm").unwrap();
