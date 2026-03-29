@@ -319,6 +319,8 @@ impl Register {
 }
 
 /// concrete value
+/// 
+/// this enum is used to represent fixed size values with unambiguous representations
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum CValue {
     U8(u8),S8(i8),
@@ -365,6 +367,7 @@ impl CValue {
             }
         })
     }
+    /// attempts to compose a [CValue] from a [VMValue] (VMType, &\[u8])
     pub fn compose(value: VMValue) -> Option<Self> {
         Some(match value.0 {
             VMType::U8 => Self::U8(value.1[0]),
@@ -382,6 +385,9 @@ impl CValue {
             _ => {return None;}
         })
     }
+    /// attempts to decompose the value into a [VMValue] of the target type
+    /// 
+    /// fails if the target type has a different size than the current type
     pub fn decompose_to<'a>(self, t: VMType<'a>) -> Option<VMValue<'a>> {
         if self.sizeof() != t.sizeof()? {
             return None;
@@ -402,6 +408,7 @@ impl CValue {
         };
         return Some(VMValue(t, bytes));
     }
+    /// decompose the concrete value into a [VMValue] containing (VMType, &\[u8])
     pub fn decompose<'a>(self) -> VMValue<'a> {
         match self {
             CValue::U8(v) => VMValue(VMType::U8, Box::from(v.to_be_bytes())),
@@ -418,8 +425,8 @@ impl CValue {
             CValue::F64(v) => VMValue(VMType::F64, Box::from(v.to_be_bytes())),
         }
     }
-
-    pub fn as_bytes(&self) -> Box<[u8]> {
+    /// converts the underlying value into a byte slice in big endian form
+    pub fn to_bytes(&self) -> Box<[u8]> {
         match self {
             CValue::U8(v) => Box::from(v.to_be_bytes()),
             CValue::S8(v) => Box::from(v.to_be_bytes()),
@@ -435,6 +442,7 @@ impl CValue {
             CValue::F64(v) => Box::from(v.to_be_bytes()),
         }
     }
+    /// copies the underlying value into `dest` in big endian representation
     pub fn copy_into(&self, dest: &mut [u8]) -> () {
         match self {
             CValue::U8(v) => {dest.copy_from_slice(&v.to_be_bytes())}
@@ -673,6 +681,7 @@ impl CValue {
 }
 
 impl CValue {
+    /// reinterprets the CValue as unsigned, if necessary
     pub fn as_unsigned(self) -> VMResult<Self> {
         Ok(match self {
             Self::U8(v) => Self::U8(v),
@@ -688,6 +697,7 @@ impl CValue {
             _ => {return Err(etodo!());}
         })
     }
+    /// reinterprets the CValue as signed, if necessary
     pub fn as_signed(self) -> VMResult<Self> {
         Ok(match self {
             Self::U8(v) => Self::S8(v as i8),
@@ -703,6 +713,7 @@ impl CValue {
             _ => {return Err(etodo!());}
         })
     }
+    /// attempts to widen the concrete value, panics if the target width is smaller than the current width
     pub fn promote_width(self, t: &Self) -> Self {
         match self {
             Self::U8(v) => match t.sizeof() {
@@ -783,11 +794,99 @@ impl CValue {
             _ => panic!("attempt to decompose non u64 CValue to u64")
         }
     }
+    pub unsafe fn u32_unchecked(self) -> u32 {
+        match self {
+            Self::U32(v) => v,
+            _ => unreachable_unchecked()
+        }
+    }
+    pub fn u32(self) -> u32 {
+        match self {
+            Self::U32(v) => v,
+            _ => panic!("attempt to decompose non u32 CValue to u32")
+        }
+    }
+    pub unsafe fn u16_unchecked(self) -> u16 {
+        match self {
+            Self::U16(v) => v,
+            _ => unreachable_unchecked()
+        }
+    }
+    pub fn u16(self) -> u16 {
+        match self {
+            Self::U16(v) => v,
+            _ => panic!("attempt to decompose non u16 CValue to u16")
+        }
+    }
+    pub unsafe fn u8_unchecked(self) -> u8 {
+        match self {
+            Self::U8(v) => v,
+            _ => unreachable_unchecked()
+        }
+    }
+    pub fn u8(self) -> u8 {
+        match self {
+            Self::U8(v) => v,
+            _ => panic!("attempt to decompose non u8 CValue to u8")
+        }
+    }
+    pub unsafe fn i64_unchecked(self) -> i64 {
+        match self {
+            Self::S64(v) => v,
+            _ => unreachable_unchecked()
+        }
+    }
+    pub fn i64(self) -> i64 {
+        match self {
+            Self::S64(v) => v,
+            _ => panic!("attempt to decompose non s64 CValue to i64")
+        }
+    }
+    pub unsafe fn i32_unchecked(self) -> i32 {
+        match self {
+            Self::S32(v) => v,
+            _ => unreachable_unchecked()
+        }
+    }
+    pub fn i32(self) -> i32 {
+        match self {
+            Self::S32(v) => v,
+            _ => panic!("attempt to decompose non s32 CValue to i32")
+        }
+    }
+    pub unsafe fn i16_unchecked(self) -> i16 {
+        match self {
+            Self::S16(v) => v,
+            _ => unreachable_unchecked()
+        }
+    }
+    pub fn i16(self) -> i16 {
+        match self {
+            Self::S16(v) => v,
+            _ => panic!("attempt to decompose non s16 CValue to i16")
+        }
+    }
+    pub unsafe fn i8_unchecked(self) -> i8 {
+        match self {
+            Self::S8(v) => v,
+            _ => unreachable_unchecked()
+        }
+    }
+    pub fn i8(self) -> i8 {
+        match self {
+            Self::S8(v) => v,
+            _ => panic!("attempt to decompose non s8 CValue to i8")
+        }
+    }
 }
 
 
 #[non_exhaustive]
 #[derive(Debug, Clone)]
+/// abstract value
+/// 
+/// this enum is used to represent types that are either
+/// do not have a known size or have variable representations
 pub enum AValue<'a> {
     PTR(VMType<'a>, CValue),
     SSTR(String),

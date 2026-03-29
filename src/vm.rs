@@ -159,7 +159,7 @@ impl<'a> TTVM<'a> {
         }
         let nsp = match self.read_reg(Register::SP, VMType::U64)?{CValue::U64(v)=>v,_=>unreachable!()} - ss;
         self.write_reg(Register::SP, CValue::U64(nsp))?;
-        self.memory.write_checked(nsp as usize, &value.as_bytes())?;
+        self.memory.write_checked(nsp as usize, &value.to_bytes())?;
         Ok(())
     }
     fn pop_value(&mut self, size: usize) -> VMResult<CValue> {
@@ -183,7 +183,7 @@ impl<'a> TTVM<'a> {
         self.write_reg(Register::SP, CValue::U64(nsp))?;
         let rval = self.read_reg(reg, readt.clone())?;
         self.write_reg(reg, CValue::U8(0))?;
-        self.memory.write_checked(nsp as usize, &rval.as_bytes())?;
+        self.memory.write_checked(nsp as usize, &rval.to_bytes())?;
         Ok(())
     }
     fn pop_subr(&mut self, reg: Register, size: usize) -> VMResult<()> {
@@ -354,7 +354,7 @@ impl<'a> TTVM<'a> {
                         }
                         if mods.oprev {
                             let xv = self.read_reg(rx, vt.clone())?;
-                            self.memory.write_checked(yv, &xv.as_bytes())?;
+                            self.memory.write_checked(yv, &xv.to_bytes())?;
                         } else {
                             if !self.reg_write_allowed(rx) {
                                 return Err(etodo!());
@@ -458,7 +458,7 @@ impl<'a> TTVM<'a> {
                     44 => {
                         if mods.oprev {
                             let xv = self.read_reg(rx, vt.clone())?;
-                            self.memory.write_checked(mz.u64() as usize, &xv.as_bytes())?;
+                            self.memory.write_checked(mz.u64() as usize, &xv.to_bytes())?;
                         } else {
                             if !self.reg_write_allowed(rx) {
                                 return Err(etodo!());
@@ -583,7 +583,7 @@ impl<'a> TTVM<'a> {
                 let wv = opt2err!(CValue::from_parts(vt.clone(), self.memory.read_checked(mw.u64() as usize, vt.sizeof().unwrap())?))?;
                 self.cmp_subr(xv, wv)?;
                 if VMCondition::EX.check(self.read_reg(Register::CF, VMType::U64)?.u64()) {
-                    self.memory.write_checked(mz.u64() as usize, &yv.as_bytes())?;
+                    self.memory.write_checked(mz.u64() as usize, &yv.to_bytes())?;
                 }
             }
             27 => {
