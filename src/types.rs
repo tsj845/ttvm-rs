@@ -98,6 +98,8 @@ impl Display for VMError {
     }
 }
 
+impl std::error::Error for VMError {}
+
 #[non_exhaustive]
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum VMPurpose {

@@ -1,3 +1,8 @@
+# 0.2.1
+
+- Made `VMError` implement `std::error::Error`
+- Added `Memory::read_cvalue`
+
 
 # 0.2.0
 

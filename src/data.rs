@@ -197,6 +197,17 @@ impl Memory {
             _ => {return Err(etodo!());}
         }
     }
+    pub fn read_cvalue(&self, offset: usize, rtype: VMType) -> VMResult<CValue> {
+        if let Some(size) = rtype.sizeof() {
+            if let Some(cv) = CValue::from_parts(rtype, self.read(offset, size)?) {
+                Ok(cv)
+            } else {
+                Err(VMError::new(VMErrorClass::Other, "unknown CValue conversion failure"))
+            }
+        } else {
+            Err(VMError::new(VMErrorClass::Invalid, "attempt to read unsized type as CValue"))
+        }
+    }
 }
 impl Index<usize> for Memory {
     type Output = u8;
