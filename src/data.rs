@@ -11,6 +11,7 @@ impl FlagBit {
     pub const CF_B: u64 = 4;
 }
 
+#[derive(Clone)]
 pub struct Memory {
     t_length: usize,
     segments: Vec<(Box<[u8]>, u8)>,
@@ -231,6 +232,7 @@ fn make_array<T: Default + Clone>(l: usize) -> Box<[T]> {
     return a.into_boxed_slice();
 }
 
+#[derive(Clone, Copy)]
 pub struct VMFlags {
     /// whether to lock constant registers
     pub const_lock: bool,

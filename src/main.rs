@@ -8,7 +8,7 @@ fn scoremoves(vm: &mut TTVM) -> VMResult<CValue> {
     return Ok(CValue::U32(0));
 }
 fn pickmove(vm: &mut TTVM) -> VMResult<CValue> {
-    return Ok(CValue::U32(1));
+    return Ok(CValue::U32(8));
 }
 
 fn main() -> VMResult<()> {
@@ -19,8 +19,10 @@ fn main() -> VMResult<()> {
     if args().any(|x|x=="--dump") {
         return Ok(());
     }
-    vm.bind_extern("scorelegalmoves", &vec![], VMType::VOID, Box::new(scoremoves))?;
-    vm.bind_extern("pickmove", &vec![], VMType::U32, Box::new(pickmove))?;
+    vm = vm.binder()
+        .bind("scorelegalmoves", &vec![], VMType::VOID, Box::new(scoremoves))?
+        .bind("pickmove", &vec![], VMType::U32, Box::new(pickmove))?
+        .finish();
     println!("{:?}", vm.execute("@init", &vec![], VMType::VOID));
     println!("{:?}", vm.execute("@think", &vec![], VMType::U32));
     // vm.ext_flags().halt_breaks = false;

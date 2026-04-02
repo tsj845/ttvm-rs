@@ -1,6 +1,11 @@
 //! the VM itself
 
-use std::{cmp::Ordering, collections::HashMap, mem, num::NonZeroUsize};
+#[cfg(feature = "tokio")]
+extern crate tokio;
+#[cfg(feature = "tokio")]
+use tokio::time::Duration;
+
+use std::{cmp::Ordering, collections::HashMap, mem, num::NonZeroUsize, sync::Arc};
 
 use crate::{parser::{self, PersistData}, types::*, data::*};
 
@@ -13,14 +18,77 @@ macro_rules! opt2err {
 }
 
 pub type ExternVMFunc = Box<dyn Fn(&mut TTVM) -> VMResult<CValue>>;
+type VMFuncMap = HashMap<usize, ExternVMFunc>;
 
+#[derive(Clone)]
+pub struct VMExecutionConfig {
+    /// a single run of the vm will not exceed this number of cycles
+    cycle_limit: usize,
+    /// the total number of cycles will not be allowed to exceed this value
+    total_cycle_limit: usize,
+    #[cfg(feature = "tokio")]
+    /// a single run of the vm will not exceed this duration
+    timeout: Duration,
+    #[cfg(feature = "tokio")]
+    /// the sum of all timeouts will not be allowed to exceed this value
+    total_timeout: Duration,
+}
+impl VMExecutionConfig {
+    #[cfg(feature = "tokio")]
+    pub fn new(cycle_limit: usize, total_cycle_limit: usize, timeout: Duration, total_timeout: Duration) -> Self {
+        Self { cycle_limit, total_cycle_limit, timeout, total_timeout }
+    }
+    #[cfg(not(feature = "tokio"))]
+    pub fn new(cycle_limit: usize, total_cycle_limit: usize) -> Self {
+        Self { cycle_limit, total_cycle_limit }
+    }
+}
+impl Default for VMExecutionConfig {
+    #[cfg(feature = "tokio")]
+    fn default() -> Self {
+        Self::new(100,100,Duration::from_millis(500),Duration::from_millis(500))
+    }
+    #[cfg(not(feature = "tokio"))]
+    fn default() -> Self {
+        Self::new(100,100)
+    }
+}
+
+#[derive(Clone)]
 pub struct TTVM<'a> {
     memory: Memory,
     regs: Box<[u8]>,
     flags: VMFlags,
     persist: PersistData<'a>,
     stack_size: u64,
+    config: VMExecutionConfig,
+    bound_funcs: Arc<VMFuncMap>,
+}
+
+pub struct VMExecutionState {
+    mem_data: Box<[Box<[u8]>]>,
+    regs: Box<[u8]>,
     bound_funcs: HashMap<usize, ExternVMFunc>,
+}
+
+pub struct TTVMFuncBinder<'a> {
+    vm: TTVM<'a>,
+    funcs: HashMap<usize, ExternVMFunc>,
+}
+impl<'a> TTVMFuncBinder<'a> {
+    pub fn bind(mut self, symbol: &str, params: &Vec<VMType>, rtype: VMType, func: ExternVMFunc) -> VMResult<Self> { 
+        self.vm.bind_extern(&mut self.funcs, symbol, params, rtype, func)?;
+        Ok(self)
+    }
+    pub fn unbind(mut self, symbol: &str) -> Self {
+        self.vm.unbind_extern(&mut self.funcs, symbol);
+        self
+    }
+    pub fn finish(mut self) -> TTVM<'a> {
+        // self.vm.bound_funcs = Box::leak(Box::new(self.funcs)) as *const HashMap<usize,ExternVMFunc> as usize;
+        self.vm.bound_funcs = Arc::new(mem::take(&mut self.funcs));
+        self.vm
+    }
 }
 
 impl<'a> TTVM<'a> {
@@ -30,7 +98,10 @@ impl<'a> TTVM<'a> {
         regs.reserve_exact(length);
         regs.resize(length, 0);
         let memory = Memory::new_uninit();
-        Self { memory, regs: regs.into_boxed_slice(), flags: VMFlags::new(), persist, stack_size: 0, bound_funcs: HashMap::new() }
+        Self { memory, regs: regs.into_boxed_slice(), flags: VMFlags::new(), persist, stack_size: 0, bound_funcs: Arc::new(HashMap::new()), config: VMExecutionConfig::default() }
+    }
+    pub fn set_config(&mut self, config: VMExecutionConfig) -> () {
+        self.config = config;
     }
     pub fn from_object_file(file: &'a [u8], stack_size: Option<NonZeroUsize>) -> VMResult<Self> {
         let (object_data, persist) = parser::ObjectData::from_object_file(file)?;
@@ -693,14 +764,16 @@ impl<'a> TTVM<'a> {
                     if mods.call {
                         if dst == CValue::U64(0xffffffff) {
                             if let Some(i) = index {
-                                let funcs = mem::replace(&mut self.bound_funcs, HashMap::new());
+                                // let funcs = mem::replace(&mut self.bound_funcs, HashMap::new());
+                                let funcs = Arc::clone(&self.bound_funcs);
+                                // println!("{:?}", bound_funcs.iter().map(|x|(x.0,type_name_of_val(x.1))).collect::<Vec<_>>());
                                 if let Some(func) = funcs.get(&i) {
                                     let v = func(self)?;
                                     self.write_reg(Register::R0, v)?;
                                 } else {
-                                    return Err(VMError::new(VMErrorClass::ETodo, "attempt to call unbound extern function"));
+                                    return Err(VMError::from_owned(VMErrorClass::ETodo, format!("attempt to call unbound extern function {}", &self.persist.index[i].name)));
                                 }
-                                self.bound_funcs = funcs;
+                                // self.bound_funcs = funcs;
                                 self.write_reg(Register::PC, CValue::U64(pc as u64))?;
                                 return Ok(VMAction::NOP);
                             } else {
@@ -765,9 +838,8 @@ impl<'a> TTVM<'a> {
             Err(e) => VMAction::ABORT(e)
         }
     }
-
-    /// begins execution at the specified symbol
-    pub fn execute(&mut self, symbol: &str, params: &Vec<VMValue>, rtype: VMType) -> VMResult<VMValue> {
+    /// sets up the vm to execute the given symbol
+    fn setup_execution(&mut self, symbol: &str, params: &Vec<VMValue>) -> VMResult<()> {
         // println!("EXECUTING {symbol}");
         self.reset_stack_pointer()?;
         self.push_value(CValue::U64(0xffffffffffffffff))?;
@@ -786,10 +858,27 @@ impl<'a> TTVM<'a> {
         let pcv = opt2err!(self.persist.index.iter().find(|x|x.name==symbol))?.offset as u64;
         // println!("SYM @ {pcv:#010x}");
         self.write_reg(Register::PC, CValue::U64(pcv))?;
-        let mut count = 0usize;
         self.flags.exited = false;
+        Ok(())
+    }
+    fn extract_return<'b>(&self, rtype: VMType) -> VMResult<VMValue<'b>> {
+        if self.flags.exited && match rtype {VMType::VOID=>false,_=>true} {
+            if rtype.sizeof().is_some() {
+                return Ok(self.read_reg(Register::R1, rtype.clone())?.decompose());
+            }
+            return Err(vmerror!("todo", "non-conrete return types"));
+        }
+        Ok(VMValue(VMType::VOID, Box::from([])))
+    }
+
+    /// begins execution at the specified symbol
+    pub fn execute(&mut self, symbol: &str, params: &Vec<VMValue>, rtype: VMType) -> VMResult<VMValue> {
+        self.setup_execution(symbol, params)?;
+        // let empty_map = HashMap::new();
+        // let map = if self.bound_funcs==0{&empty_map}else{unsafe {&*(self.bound_funcs as *const HashMap<usize, ExternVMFunc>)}};
+        let mut count = 0usize;
         loop {
-            if count > 100 {
+            if count > self.config.cycle_limit {
                 return Err(vmerror!("todo", "count exceeded"));
             }
             count += 1;
@@ -799,15 +888,21 @@ impl<'a> TTVM<'a> {
                 VMAction::STOP => {self.flags.exited = true;break;}
             }
         }
-        if self.flags.exited && match rtype {VMType::VOID=>false,_=>true} {
-            if rtype.sizeof().is_some() {
-                return Ok(self.read_reg(Register::R1, rtype.clone())?.decompose())
-            }
-            return Err(vmerror!("todo", "non-conrete return types"));
-        }
-        Ok(VMValue(VMType::VOID, Box::from([])))
+        self.extract_return(rtype)
     }
-    pub fn bind_extern(&mut self, symbol: &str, params: &Vec<VMType>, rtype: VMType, func: ExternVMFunc) -> VMResult<()> {
+    pub fn binder(mut self) -> TTVMFuncBinder<'a> {
+        // let funcs = if self.bound_funcs==0{HashMap::new()}else{
+        //     unsafe {
+        //         mem::take(&mut *(self.bound_funcs as *mut HashMap<usize,ExternVMFunc>))
+        //     }
+        // };
+        let funcs = Arc::into_inner(mem::take(&mut self.bound_funcs)).unwrap();
+        TTVMFuncBinder { vm: self, funcs }
+    }
+    /// binds an external function to the specified symbol
+    /// 
+    /// fails if the specified signature does not match the actual signature of the symbol
+    pub fn bind_extern(&self, bound_funcs: &mut HashMap<usize, ExternVMFunc>, symbol: &str, params: &Vec<VMType>, rtype: VMType, func: ExternVMFunc) -> VMResult<()> {
         let mut e = None;
         for i in 0..self.persist.index.len() {
             let ent = &self.persist.index[i];
@@ -823,7 +918,7 @@ impl<'a> TTVM<'a> {
             }
         }
         if let Some(index) = e {
-            if let Some(_) = self.bound_funcs.insert(index, func) {
+            if let Some(_) = bound_funcs.insert(index, func) {
                 return Err(VMError::new(VMErrorClass::ETodo, "attempt to bind to already bound function"));
             }
             return Ok(());
@@ -831,12 +926,57 @@ impl<'a> TTVM<'a> {
             return Err(VMError::new(VMErrorClass::Invalid, "attempt to bind non-existent function"));
         }
     }
-    pub fn unbind_extern(&mut self, symbol: &str) -> () {
+    /// removes the function bound to the specified symbol, if any
+    pub fn unbind_extern(&self, bound_funcs: &mut HashMap<usize, ExternVMFunc>, symbol: &str) -> () {
         for i in 0..self.persist.index.len() {
             if self.persist.index[i].name == symbol {
-                let _ = self.bound_funcs.remove(&i);
+                let _ = bound_funcs.remove(&i);
             }
         }
+    }
+}
+
+#[cfg(feature = "tokio")]
+impl<'a> TTVM<'a> {
+    pub async fn execute_async(&mut self, symbol: &str, params: &Vec<VMValue<'_>>, rtype: VMType<'_>, timeout: Option<Duration>) -> VMResult<VMValue> {
+    //     let empty_map = HashMap::new();
+    //     let bf = self.bound_funcs;
+    //     let map = if self.bound_funcs==0{empty_map}else{unsafe {mem::take(&mut *(self.bound_funcs.clone() as *mut HashMap<usize, ExternVMFunc>))}};
+    //     let rv = self._execute_async(&map, symbol, params, rtype, timeout).await;
+    //     if bf != 0 {
+    //         unsafe {let _ = mem::replace(&mut *(self.bound_funcs.clone() as *mut _), map);}
+    //     }
+    //     rv
+    // }
+    // async fn _execute_async<'b>(&mut self, map: &HashMap<usize, ExternVMFunc>, symbol: &str, params: &Vec<VMValue<'_>>, rtype: VMType<'_>, timeout: Option<Duration>) -> VMResult<VMValue<'b>> {
+        self.setup_execution(symbol, params)?;
+        let timer_duration = timeout.unwrap_or(self.config.timeout);
+        let mut total_count = 0;
+        let mut total_time = Duration::from_millis(0);
+        'outer: loop {
+            let mut count = 0;
+            let timer = tokio::time::sleep(timer_duration);
+            'inner: loop {
+                if count > self.config.cycle_limit || timer.is_elapsed() {
+                    use tokio::time::Instant;
+
+                    total_count += count;
+                    total_time += timer.deadline() - Instant::now();
+                    tokio::task::yield_now().await;
+                    break 'inner;
+                }
+                match self.execute_instruction() {
+                    VMAction::NOP => {},
+                    VMAction::ABORT(e) => {return Err(e);},
+                    VMAction::STOP => {self.flags.exited = true;break 'outer;}
+                }
+                count += 1;
+            }
+            if total_count > self.config.total_cycle_limit || total_time > self.config.total_timeout {
+                return Err(vmerror!("todo", "count/time exceed"));
+            }
+        }
+        self.extract_return(rtype)
     }
 }
 

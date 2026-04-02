@@ -1,6 +1,6 @@
 [package]
 name = "territopple_vm"
-version = "0.2.2"
+version = "0.3.0"
 edition = "2021"
 repository = "https://github.com/tsj845/ttvm-rs"
 license-file = "UNLICENSE"
@@ -15,3 +15,7 @@ exclude = [
 ]
 
 [dependencies]
+tokio = {version = "*",features = ["rt","time"],optional = true}
+
+# [features]
+# default = []

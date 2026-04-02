@@ -1,3 +1,6 @@
+# 0.3.0
+- Added support for timeouts when executing the vm
+
 # 0.2.2
 - Added ability to bind/unbind external functions to symbols in the index
 
