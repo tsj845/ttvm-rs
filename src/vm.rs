@@ -1,6 +1,6 @@
 //! the VM itself
 
-use std::{cmp::Ordering, num::NonZeroUsize};
+use std::{cmp::Ordering, collections::HashMap, mem, num::NonZeroUsize};
 
 use crate::{parser::{self, PersistData}, types::*, data::*};
 
@@ -12,12 +12,15 @@ macro_rules! opt2err {
     };
 }
 
+pub type ExternVMFunc = Box<dyn Fn(&mut TTVM) -> VMResult<CValue>>;
+
 pub struct TTVM<'a> {
     memory: Memory,
     regs: Box<[u8]>,
     flags: VMFlags,
     persist: PersistData<'a>,
     stack_size: u64,
+    bound_funcs: HashMap<usize, ExternVMFunc>,
 }
 
 impl<'a> TTVM<'a> {
@@ -27,7 +30,7 @@ impl<'a> TTVM<'a> {
         regs.reserve_exact(length);
         regs.resize(length, 0);
         let memory = Memory::new_uninit();
-        Self { memory, regs: regs.into_boxed_slice(), flags: VMFlags::new(), persist, stack_size: 0 }
+        Self { memory, regs: regs.into_boxed_slice(), flags: VMFlags::new(), persist, stack_size: 0, bound_funcs: HashMap::new() }
     }
     pub fn from_object_file(file: &'a [u8], stack_size: Option<NonZeroUsize>) -> VMResult<Self> {
         let (object_data, persist) = parser::ObjectData::from_object_file(file)?;
@@ -163,23 +166,28 @@ impl<'a> TTVM<'a> {
         Ok(())
     }
     fn pop_value(&mut self, size: usize) -> VMResult<CValue> {
-        if size > 3 {
+        if size.count_ones() != 1 {
             return Err(etodo!());
         }
-        let readt = &DT_SIZE_MAP[size];
-        let ss = 1 << size;
+        if size > 8 {
+            return Err(etodo!());
+        }
+        let ss = size.trailing_zeros() as usize;
+        let readt = &DT_SIZE_MAP[ss];
         let csp = match self.read_reg(Register::SP, VMType::U64)?{CValue::U64(v)=>v,_=>unreachable!()};
-        let rval = opt2err!(CValue::from_parts(readt.clone(), self.memory.read_checked(csp as usize, ss as usize)?))?;
-        self.write_reg(Register::SP, CValue::U64(csp + ss))?;
+        let rval = opt2err!(CValue::from_parts(readt.clone(), self.memory.read_checked(csp as usize, size)?))?;
+        self.write_reg(Register::SP, CValue::U64(csp + size as u64))?;
         Ok(rval)
     }
     fn push_subr(&mut self, reg: Register, size: usize) -> VMResult<()> {
-        if size > 3 {
+        if size.count_ones() != 1 {
             return Err(etodo!());
         }
-        let readt = &DT_SIZE_MAP[size];
-        let ss = 1 << size;
-        let nsp = match self.read_reg(Register::SP, VMType::U64)?{CValue::U64(v)=>v,_=>unreachable!()} - ss;
+        if size > 8 {
+            return Err(etodo!());
+        }
+        let readt = &DT_SIZE_MAP[size.trailing_zeros() as usize];
+        let nsp = match self.read_reg(Register::SP, VMType::U64)?{CValue::U64(v)=>v,_=>unreachable!()} - size as u64;
         self.write_reg(Register::SP, CValue::U64(nsp))?;
         let rval = self.read_reg(reg, readt.clone())?;
         self.write_reg(reg, CValue::U8(0))?;
@@ -187,14 +195,16 @@ impl<'a> TTVM<'a> {
         Ok(())
     }
     fn pop_subr(&mut self, reg: Register, size: usize) -> VMResult<()> {
-        if size > 3 {
+        if size.count_ones() != 1 {
             return Err(etodo!());
         }
-        let readt = &DT_SIZE_MAP[size];
-        let ss = 1 << size;
+        if size > 8 {
+            return Err(etodo!());
+        }
+        let readt = &DT_SIZE_MAP[size.trailing_zeros() as usize];
         let csp = match self.read_reg(Register::SP, VMType::U64)?{CValue::U64(v)=>v,_=>unreachable!()};
-        let rval = opt2err!(CValue::from_parts(readt.clone(), self.memory.read_checked(csp as usize, ss as usize)?))?;
-        self.write_reg(Register::SP, CValue::U64(csp + ss))?;
+        let rval = opt2err!(CValue::from_parts(readt.clone(), self.memory.read_checked(csp as usize, size)?))?;
+        self.write_reg(Register::SP, CValue::U64(csp + size as u64))?;
         self.write_reg(reg, rval)?;
         Ok(())
     }
@@ -589,12 +599,12 @@ impl<'a> TTVM<'a> {
             27 => {
                 mods.era = true;
                 let rx = self.read_arg_reg(&mut nf, &mut pc, &mut cb, &mods)?;
-                self.push_subr(rx, mods.size as usize)?;
+                self.push_subr(rx, 1 << mods.size)?;
             }
             28 => {
                 mods.era = true;
                 let rx = self.read_arg_reg(&mut nf, &mut pc, &mut cb, &mods)?;
-                self.pop_subr(rx, mods.size as usize)?;
+                self.pop_subr(rx, 1 << mods.size)?;
             }
             // syscall
             42 => {
@@ -608,6 +618,10 @@ impl<'a> TTVM<'a> {
             // ret
             41 => {
                 let raddr = self.pop_value(8)?;
+                if raddr == CValue::U64(0xffffffffffffffff) {
+                    self.write_reg(Register::R1, self.read_reg(Register::R0, VMType::U64)?)?;
+                    return Ok(VMAction::STOP);
+                }
                 self.write_reg(Register::PC, raddr)?;
             }
             // jmp/jcc
@@ -615,6 +629,7 @@ impl<'a> TTVM<'a> {
                 let rx = Register::from_byte(self.read_arg_nybble(&mut nf, &mut pc, &mut cb)?);
                 let jf = self.read_arg_nybble(&mut nf, &mut pc, &mut cb)?;
                 let dst;
+                let mut index = None;
                 if mods.call {
                     if jf & 4 != 0 {
                         if jf & 2 != 0 {
@@ -624,7 +639,9 @@ impl<'a> TTVM<'a> {
                                 dst = self.read_inline_value(1, &mut pc, VMType::U64)?;
                             }
                         } else {
-                            dst = CValue::U64(opt2err!(self.persist.index.get(self.read_inline_value(1, &mut pc, VMType::U64)?.u64() as usize))?.offset as u64);
+                            let i = self.read_inline_value(1, &mut pc, VMType::U64)?.u64() as usize;
+                            index = Some(i);
+                            dst = CValue::U64(opt2err!(self.persist.index.get(i))?.offset as u64);
                         }
                     } else {
                         if jf & 2 != 0 {
@@ -674,6 +691,22 @@ impl<'a> TTVM<'a> {
                 };
                 if proceed {
                     if mods.call {
+                        if dst == CValue::U64(0xffffffff) {
+                            if let Some(i) = index {
+                                let funcs = mem::replace(&mut self.bound_funcs, HashMap::new());
+                                if let Some(func) = funcs.get(&i) {
+                                    let v = func(self)?;
+                                    self.write_reg(Register::R0, v)?;
+                                } else {
+                                    return Err(VMError::new(VMErrorClass::ETodo, "attempt to call unbound extern function"));
+                                }
+                                self.bound_funcs = funcs;
+                                self.write_reg(Register::PC, CValue::U64(pc as u64))?;
+                                return Ok(VMAction::NOP);
+                            } else {
+                                return Err(VMError::new(VMErrorClass::ETodo, "invalid call address"));
+                            }
+                        }
                         self.push_value(CValue::U64(pc as u64))?;
                     }
                     pc = dst.u64() as usize;
@@ -737,6 +770,7 @@ impl<'a> TTVM<'a> {
     pub fn execute(&mut self, symbol: &str, params: &Vec<VMValue>, rtype: VMType) -> VMResult<VMValue> {
         // println!("EXECUTING {symbol}");
         self.reset_stack_pointer()?;
+        self.push_value(CValue::U64(0xffffffffffffffff))?;
         for (i, p) in params.iter().take(4).enumerate() {
             if p.0.sizeof().is_none() {
                 return Err(vmerror!("todo", "non-concrete params"));
@@ -772,6 +806,37 @@ impl<'a> TTVM<'a> {
             return Err(vmerror!("todo", "non-conrete return types"));
         }
         Ok(VMValue(VMType::VOID, Box::from([])))
+    }
+    pub fn bind_extern(&mut self, symbol: &str, params: &Vec<VMType>, rtype: VMType, func: ExternVMFunc) -> VMResult<()> {
+        let mut e = None;
+        for i in 0..self.persist.index.len() {
+            let ent = &self.persist.index[i];
+            if ent.name == symbol {
+                if !ent.params.iter().enumerate().all(|x|params[x.0]==x.1.0) {
+                    return Err(VMError::new(VMErrorClass::Invalid, "attempt to bind function with parameter type mismatch"));
+                }
+                if ent.rtype != rtype {
+                    return Err(VMError::new(VMErrorClass::Invalid, "attempt to bind function with return type mismatch"));
+                }
+                e = Some(i);
+                break;
+            }
+        }
+        if let Some(index) = e {
+            if let Some(_) = self.bound_funcs.insert(index, func) {
+                return Err(VMError::new(VMErrorClass::ETodo, "attempt to bind to already bound function"));
+            }
+            return Ok(());
+        } else {
+            return Err(VMError::new(VMErrorClass::Invalid, "attempt to bind non-existent function"));
+        }
+    }
+    pub fn unbind_extern(&mut self, symbol: &str) -> () {
+        for i in 0..self.persist.index.len() {
+            if self.persist.index[i].name == symbol {
+                let _ = self.bound_funcs.remove(&i);
+            }
+        }
     }
 }
 

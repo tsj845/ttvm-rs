@@ -122,7 +122,7 @@ impl VMPurpose {
 }
 
 #[non_exhaustive]
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub enum TStructDescriptor<'a> {
     Root(&'a TStructDescriptor<'a>),
     Invalid,
@@ -133,7 +133,7 @@ impl TStructDescriptor<'static> {
 }
 
 #[non_exhaustive]
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub enum VMType<'a> {
     U8,
     S8,

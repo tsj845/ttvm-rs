@@ -1,3 +1,6 @@
+# 0.2.2
+- Added ability to bind/unbind external functions to symbols in the index
+
 # 0.2.1
 
 - Made `VMError` implement `std::error::Error`
