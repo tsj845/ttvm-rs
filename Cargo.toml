@@ -15,7 +15,7 @@ exclude = [
 ]
 
 [dependencies]
-tokio = {version = "*",features = ["rt","time"],optional = true}
+tokio = {version = "^1",features = ["rt","time"],optional = true}
 
 # [features]
 # default = []
