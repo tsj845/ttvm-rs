@@ -5,7 +5,7 @@ extern crate tokio;
 #[cfg(feature = "tokio")]
 use tokio::time::Duration;
 
-use std::{cmp::Ordering, collections::HashMap, mem, num::NonZeroUsize, sync::Arc};
+use std::{cmp::Ordering, collections::HashMap, fmt::Debug, num::NonZeroUsize};
 
 use crate::{parser::{self, PersistData}, types::*, data::*};
 
@@ -55,6 +55,37 @@ impl Default for VMExecutionConfig {
 }
 
 #[derive(Clone)]
+pub struct CallStack {
+    backing: Vec<String>
+}
+impl Debug for CallStack {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.backing.fmt(f)
+    }
+}
+impl CallStack {
+    pub fn new() -> Self {
+        Self { backing: Vec::new() }
+    }
+    pub fn push(&mut self, call: String) -> () {
+        #[cfg(feature = "debug")]
+        println!("Entered call: {call}");
+        self.backing.push(call);
+    }
+    pub fn pop(&mut self) -> Option<String> {
+        let ret = self.backing.pop();
+        #[cfg(feature = "debug")]
+        println!("Exited call: {ret:?}");
+        ret
+    }
+    pub fn clear(&mut self) -> () {
+        #[cfg(feature = "debug")]
+        println!("Call stack cleared");
+        self.backing.clear();
+    }
+}
+
+#[derive(Clone)]
 pub struct TTVM<'a> {
     memory: Memory,
     regs: Box<[u8]>,
@@ -62,20 +93,30 @@ pub struct TTVM<'a> {
     persist: PersistData<'a>,
     stack_size: u64,
     config: VMExecutionConfig,
-    bound_funcs: Arc<VMFuncMap>,
+    call_stack: CallStack,
 }
 
 pub struct VMExecutionState {
     mem_data: Box<[Box<[u8]>]>,
     regs: Box<[u8]>,
-    bound_funcs: HashMap<usize, ExternVMFunc>,
 }
 
-pub struct TTVMFuncBinder<'a> {
-    vm: TTVM<'a>,
+pub struct VMBoundFuncs(VMFuncMap);
+
+impl VMBoundFuncs {
+    pub fn empty() -> Self {
+        Self(HashMap::new())
+    }
+}
+
+pub struct TTVMFuncBinder<'a, 'b> {
+    vm: &'b TTVM<'a>,
     funcs: HashMap<usize, ExternVMFunc>,
 }
-impl<'a> TTVMFuncBinder<'a> {
+impl<'a, 'b> TTVMFuncBinder<'a, 'b> {
+    pub fn new(vm: &'b TTVM<'a>) -> Self {
+        Self { vm, funcs: HashMap::new() }
+    }
     pub fn bind(mut self, symbol: &str, params: &Vec<VMType>, rtype: VMType, func: ExternVMFunc) -> VMResult<Self> { 
         self.vm.bind_extern(&mut self.funcs, symbol, params, rtype, func)?;
         Ok(self)
@@ -84,10 +125,9 @@ impl<'a> TTVMFuncBinder<'a> {
         self.vm.unbind_extern(&mut self.funcs, symbol);
         self
     }
-    pub fn finish(mut self) -> TTVM<'a> {
+    pub fn finish(self) -> VMBoundFuncs {
         // self.vm.bound_funcs = Box::leak(Box::new(self.funcs)) as *const HashMap<usize,ExternVMFunc> as usize;
-        self.vm.bound_funcs = Arc::new(mem::take(&mut self.funcs));
-        self.vm
+        VMBoundFuncs(self.funcs)
     }
 }
 
@@ -98,7 +138,7 @@ impl<'a> TTVM<'a> {
         regs.reserve_exact(length);
         regs.resize(length, 0);
         let memory = Memory::new_uninit();
-        Self { memory, regs: regs.into_boxed_slice(), flags: VMFlags::new(), persist, stack_size: 0, bound_funcs: Arc::new(HashMap::new()), config: VMExecutionConfig::default() }
+        Self { memory, regs: regs.into_boxed_slice(), flags: VMFlags::new(), persist, stack_size: 0, config: VMExecutionConfig::default(), call_stack: CallStack::new() }
     }
     pub fn set_config(&mut self, config: VMExecutionConfig) -> () {
         self.config = config;
@@ -138,7 +178,7 @@ impl<'a> TTVM<'a> {
         Ok(raw)
     }
     fn reset_stack_pointer(&mut self) -> VMResult<()> {
-        self.write_reg(Register::SP, CValue::U64(self.stack_size))
+        self.write_reg(Register::SP, CValue::U64(self.stack_size+self.memory.offset_of(Memory::S_STACK) as u64))
     }
 }
 
@@ -157,6 +197,9 @@ impl<'a> TTVM<'a> {
     }
     pub fn none_flags(&self) -> u16 {
         return self.persist.none;
+    }
+    pub fn call_stack<'b>(&'b self) -> &'b CallStack {
+        &self.call_stack
     }
 }
 
@@ -246,7 +289,11 @@ impl<'a> TTVM<'a> {
         let ss = size.trailing_zeros() as usize;
         let readt = &DT_SIZE_MAP[ss];
         let csp = match self.read_reg(Register::SP, VMType::U64)?{CValue::U64(v)=>v,_=>unreachable!()};
-        let rval = opt2err!(CValue::from_parts(readt.clone(), self.memory.read_checked(csp as usize, size)?))?;
+        let olck = self.memory.seg_lock;
+        self.memory.lock_seg(self.memory.offset_of(Memory::S_STACK))?;
+        let rval = opt2err!(CValue::from_parts(readt.clone(), self.memory.get_range_checked(csp as usize, size)?))?;
+        self.memory.unlock_seg();
+        self.memory.seg_lock = olck;
         self.write_reg(Register::SP, CValue::U64(csp + size as u64))?;
         Ok(rval)
     }
@@ -281,7 +328,7 @@ impl<'a> TTVM<'a> {
     }
 
     /// executes a single instruction
-    fn execute_instruction_impl(&mut self) -> VMResult<VMAction> {
+    fn execute_instruction_impl(&mut self, bound_funcs: &VMBoundFuncs) -> VMResult<VMAction> {
         let mut pc = match self.read_reg(Register::PC, VMType::U64)? {CValue::U64(v)=>v,_=>unreachable!()} as usize;
         if self.memory.get_perms_at(pc)? & Memory::P_EXEC == 0 {
             return Err(vmerror!(format!("attempt to execute from non-executable memory (address {pc:#010x})")));
@@ -323,6 +370,8 @@ impl<'a> TTVM<'a> {
         }
         let opcode = cb;
         let _dbgass_pc = pc;
+        #[cfg(feature = "debug")]
+        {println!("{:#03} -> {_dbgass_pc:#010x} : {:#06x}", self.flags.run_depth, self.read_reg(Register::SP, VMType::U64)?.u64());}
         pc += 1;
         let vt = match mods.size {
             0 => VMType::U8,
@@ -689,10 +738,13 @@ impl<'a> TTVM<'a> {
             // ret
             41 => {
                 let raddr = self.pop_value(8)?;
+                #[cfg(feature = "debug")]
+                {println!("returning to address {:#018x}", raddr.u64());}
                 if raddr == CValue::U64(0xffffffffffffffff) {
                     self.write_reg(Register::R1, self.read_reg(Register::R0, VMType::U64)?)?;
                     return Ok(VMAction::STOP);
                 }
+                let _ = self.call_stack.pop();
                 self.write_reg(Register::PC, raddr)?;
             }
             // jmp/jcc
@@ -765,10 +817,13 @@ impl<'a> TTVM<'a> {
                         if dst == CValue::U64(0xffffffff) {
                             if let Some(i) = index {
                                 // let funcs = mem::replace(&mut self.bound_funcs, HashMap::new());
-                                let funcs = Arc::clone(&self.bound_funcs);
+                                // let funcs = Arc::clone(&self.bound_funcs);
                                 // println!("{:?}", bound_funcs.iter().map(|x|(x.0,type_name_of_val(x.1))).collect::<Vec<_>>());
-                                if let Some(func) = funcs.get(&i) {
+                                self.call_stack.push(format!("Bound function '{}'", &self.persist.index[i].name));
+                                if let Some(func) = bound_funcs.0.get(&i) {
+                                    self.flags.run_depth += 1;
                                     let v = func(self)?;
+                                    self.flags.run_depth -= 1;
                                     self.write_reg(Register::R0, v)?;
                                 } else {
                                     return Err(VMError::from_owned(VMErrorClass::ETodo, format!("attempt to call unbound extern function {}", &self.persist.index[i].name)));
@@ -780,6 +835,7 @@ impl<'a> TTVM<'a> {
                                 return Err(VMError::new(VMErrorClass::ETodo, "invalid call address"));
                             }
                         }
+                        self.call_stack.push(format!("Function at address {:010x}", dst.u64()));
                         self.push_value(CValue::U64(pc as u64))?;
                     }
                     pc = dst.u64() as usize;
@@ -811,6 +867,19 @@ impl<'a> TTVM<'a> {
                             }
                             202 => {
                                 println!("IV: {:?}", self.ext_read_reg(Register::INVAR, VMType::U64)?);
+                                println!("STACK: {}", self.memory.offset_of(Memory::S_STACK));
+                            }
+                            203 => {
+                                println!("CALLS: {:?}", &self.call_stack);
+                                let sp = self.read_reg(Register::SP, VMType::U64)?.u64() as usize;
+                                println!("SP: {:?}", sp);
+                                let o = self.memory.offset_of(Memory::S_STACK);
+                                if sp < o+self.stack_size as usize {
+                                    let olck = self.memory.seg_lock;
+                                    self.memory.seg_lock = None;
+                                    println!("STACK: {:?}", self.memory.get_range(sp,self.stack_size as usize+o-sp));
+                                    self.memory.seg_lock = olck;
+                                }
                             }
                             _ => {ndbg = true;}
                         }
@@ -830,8 +899,8 @@ impl<'a> TTVM<'a> {
         Ok(ract)
     }
     /// converts underlying errors into [VMAction::ABORT] instances
-    fn execute_instruction(&mut self) -> VMAction {
-        let res = self.execute_instruction_impl();
+    fn execute_instruction(&mut self, bound_funcs: &VMBoundFuncs) -> VMAction {
+        let res = self.execute_instruction_impl(bound_funcs);
         self.memory.unlock_seg();
         match res {
             Ok(v) => v,
@@ -840,8 +909,12 @@ impl<'a> TTVM<'a> {
     }
     /// sets up the vm to execute the given symbol
     fn setup_execution(&mut self, symbol: &str, params: &Vec<VMValue>) -> VMResult<()> {
+        self.call_stack.push(format!("Extern call to '{symbol}'"));
         // println!("EXECUTING {symbol}");
-        self.reset_stack_pointer()?;
+        if self.flags.run_depth == 0 {
+            self.reset_stack_pointer()?;
+        }
+        self.flags.run_depth += 1;
         self.push_value(CValue::U64(0xffffffffffffffff))?;
         for (i, p) in params.iter().take(4).enumerate() {
             if p.0.sizeof().is_none() {
@@ -861,7 +934,12 @@ impl<'a> TTVM<'a> {
         self.flags.exited = false;
         Ok(())
     }
-    fn extract_return<'b>(&self, rtype: VMType) -> VMResult<VMValue<'b>> {
+    fn extract_return<'b>(&mut self, rtype: VMType) -> VMResult<VMValue<'b>> {
+        if self.flags.run_depth == 0 {
+            self.call_stack.clear();
+        } else {
+            let _ = self.call_stack.pop();
+        }
         if self.flags.exited && match rtype {VMType::VOID=>false,_=>true} {
             if rtype.sizeof().is_some() {
                 return Ok(self.read_reg(Register::R1, rtype.clone())?.decompose());
@@ -870,34 +948,29 @@ impl<'a> TTVM<'a> {
         }
         Ok(VMValue(VMType::VOID, Box::from([])))
     }
-
-    /// begins execution at the specified symbol
     pub fn execute(&mut self, symbol: &str, params: &Vec<VMValue>, rtype: VMType) -> VMResult<VMValue> {
+        self.bound_execute(symbol, params, rtype, None)
+    }
+    /// begins execution at the specified symbol
+    pub fn bound_execute(&mut self, symbol: &str, params: &Vec<VMValue>, rtype: VMType, bindings: Option<&VMBoundFuncs>) -> VMResult<VMValue> {
         self.setup_execution(symbol, params)?;
         // let empty_map = HashMap::new();
         // let map = if self.bound_funcs==0{&empty_map}else{unsafe {&*(self.bound_funcs as *const HashMap<usize, ExternVMFunc>)}};
+        let empty = VMBoundFuncs::empty();
+        let bound_funcs = bindings.unwrap_or(&empty);
         let mut count = 0usize;
         loop {
             if count > self.config.cycle_limit {
                 return Err(vmerror!("todo", "count exceeded"));
             }
             count += 1;
-            match self.execute_instruction() {
+            match self.execute_instruction(bound_funcs) {
                 VMAction::NOP => {},
-                VMAction::ABORT(e) => {return Err(e);},
-                VMAction::STOP => {self.flags.exited = true;break;}
+                VMAction::ABORT(e) => {self.flags.run_depth=0;return Err(e);},
+                VMAction::STOP => {self.flags.run_depth-=1;self.flags.exited = true;break;}
             }
         }
         self.extract_return(rtype)
-    }
-    pub fn binder(mut self) -> TTVMFuncBinder<'a> {
-        // let funcs = if self.bound_funcs==0{HashMap::new()}else{
-        //     unsafe {
-        //         mem::take(&mut *(self.bound_funcs as *mut HashMap<usize,ExternVMFunc>))
-        //     }
-        // };
-        let funcs = Arc::into_inner(mem::take(&mut self.bound_funcs)).unwrap();
-        TTVMFuncBinder { vm: self, funcs }
     }
     /// binds an external function to the specified symbol
     /// 
@@ -939,6 +1012,9 @@ impl<'a> TTVM<'a> {
 #[cfg(feature = "tokio")]
 impl<'a> TTVM<'a> {
     pub async fn execute_async(&mut self, symbol: &str, params: &Vec<VMValue<'_>>, rtype: VMType<'_>, timeout: Option<Duration>) -> VMResult<VMValue> {
+        self.bound_execute_async(symbol, params, rtype, timeout, None).await
+    }
+    pub async fn bound_execute_async(&mut self, symbol: &str, params: &Vec<VMValue<'_>>, rtype: VMType<'_>, timeout: Option<Duration>, bindings: Option<&VMBoundFuncs>) -> VMResult<VMValue> {
     //     let empty_map = HashMap::new();
     //     let bf = self.bound_funcs;
     //     let map = if self.bound_funcs==0{empty_map}else{unsafe {mem::take(&mut *(self.bound_funcs.clone() as *mut HashMap<usize, ExternVMFunc>))}};
@@ -953,6 +1029,8 @@ impl<'a> TTVM<'a> {
         let timer_duration = timeout.unwrap_or(self.config.timeout);
         let mut total_count = 0;
         let mut total_time = Duration::from_millis(0);
+        let empty = VMBoundFuncs::empty();
+        let bound_funcs = bindings.unwrap_or(&empty);
         'outer: loop {
             let mut count = 0;
             let timer = tokio::time::sleep(timer_duration);
@@ -965,10 +1043,10 @@ impl<'a> TTVM<'a> {
                     tokio::task::yield_now().await;
                     break 'inner;
                 }
-                match self.execute_instruction() {
+                match self.execute_instruction(bound_funcs) {
                     VMAction::NOP => {},
-                    VMAction::ABORT(e) => {return Err(e);},
-                    VMAction::STOP => {self.flags.exited = true;break 'outer;}
+                    VMAction::ABORT(e) => {self.flags.run_depth=0;return Err(e);},
+                    VMAction::STOP => {self.flags.run_depth-=1;self.flags.exited = true;break 'outer;}
                 }
                 count += 1;
             }

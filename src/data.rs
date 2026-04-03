@@ -15,7 +15,7 @@ impl FlagBit {
 pub struct Memory {
     t_length: usize,
     segments: Vec<(Box<[u8]>, u8)>,
-    seg_lock: Option<NonZeroU8>,
+    pub(crate) seg_lock: Option<NonZeroU8>,
 }
 
 impl Memory {
@@ -146,6 +146,28 @@ impl Memory {
         }
         return Ok(&self.segments[seg].0[offset-base..offset-base+count]);
     }
+    /// read a slice, taking segment lock and permissions into account
+    pub fn get_range_checked<'a>(&'a self, offset: usize, count: usize) -> VMResult<&'a [u8]> {
+        if offset >= self.t_length {
+            // println!("out of tlen");
+            return Err(vmerror!("offset larger than total memory size"));
+        }
+        let (seg, base) = self.get_base_segment(offset).unwrap();
+        if self.segments[seg].1 & Self::P_READ == 0 {
+            return Err(VMError::new(VMErrorClass::Perms, "attempt to read from non-readable memory"));
+        }
+        if let Some(v) = self.seg_lock {
+            if (v.get()-1) as usize != seg {
+                // println!("not locked segment");
+                return Err(vmerror!("offset not in locked segment"));
+            }
+            // println!("{offset}-{base}+{count}={} ? {}", offset-base+count, self.segments[seg].0.len());
+            if self.segments[seg].0.len() < offset-base+count {
+                return Err(vmerror!(format!("crosses boundary {} / {}", self.segments[seg].0.len(), offset-base+count)));
+            }
+        }
+        return Ok(&self.segments[seg].0[offset-base..offset-base+count]);
+    }
     /// lock reads to whatever segment offset is in
     pub fn lock_seg(&mut self, offset: usize) -> VMResult<()> {
         unsafe {
@@ -237,7 +259,7 @@ pub struct VMFlags {
     /// whether to lock constant registers
     pub const_lock: bool,
     /// whether the VM has exited
-    pub exited: bool,
+    pub(crate) exited: bool,
     /// whether the VM is in priviledged mode
     pub priv_mode: bool,
     /// whether to interpret certain BRK instructions as debugging signals
@@ -246,11 +268,18 @@ pub struct VMFlags {
     pub ignore_breaks: bool,
     /// whether to halt on BRK instructions
     pub halt_breaks: bool,
+    // /// enable dev debugging statements
+    // pub dev_debug: bool,
+    /// used to avoid erroneously resetting the stack pointer
+    pub(crate) run_depth: u16,
 }
 
 impl VMFlags {
     pub fn new() -> Self {
-        Self { const_lock: true, exited: false, priv_mode: false, debug_breaks: false, ignore_breaks: true, halt_breaks: true }
+        Self { const_lock: true, exited: false, run_depth: 0, priv_mode: false, debug_breaks: false, ignore_breaks: true, halt_breaks: true }
+    }
+    pub fn exited(&self) -> bool {
+        self.exited
     }
 }
 

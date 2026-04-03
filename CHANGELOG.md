@@ -1,3 +1,7 @@
+# 0.4.0
+- Added debugging feature
+- Fixed the inability to have state accessed from bound VM functions
+
 # 0.3.0
 - Added support for timeouts when executing the vm
 
