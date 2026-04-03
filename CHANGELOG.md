@@ -1,3 +1,7 @@
+# 0.5.0
+- Updated the Tokio depenency to require `sync` for use in the future
+- Fixed a lifetime issue
+
 # 0.4.0
 - Added debugging feature
 - Fixed the inability to have state accessed from bound VM functions

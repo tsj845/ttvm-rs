@@ -17,8 +17,8 @@ macro_rules! opt2err {
     };
 }
 
-pub type ExternVMFunc = Box<dyn Fn(&mut TTVM) -> VMResult<CValue>>;
-type VMFuncMap = HashMap<usize, ExternVMFunc>;
+pub type ExternVMFunc<'a> = Box<dyn Fn(&mut TTVM) -> VMResult<CValue> + 'a>;
+type VMFuncMap<'a> = HashMap<usize, ExternVMFunc<'a>>;
 
 #[derive(Clone)]
 pub struct VMExecutionConfig {
@@ -101,23 +101,23 @@ pub struct VMExecutionState {
     regs: Box<[u8]>,
 }
 
-pub struct VMBoundFuncs(VMFuncMap);
+pub struct VMBoundFuncs<'a>(VMFuncMap<'a>);
 
-impl VMBoundFuncs {
+impl VMBoundFuncs<'_> {
     pub fn empty() -> Self {
         Self(HashMap::new())
     }
 }
 
-pub struct TTVMFuncBinder<'a, 'b> {
+pub struct TTVMFuncBinder<'a, 'b, 'c> {
     vm: &'b TTVM<'a>,
-    funcs: HashMap<usize, ExternVMFunc>,
+    funcs: HashMap<usize, ExternVMFunc<'c>>,
 }
-impl<'a, 'b> TTVMFuncBinder<'a, 'b> {
+impl<'a, 'b, 'c> TTVMFuncBinder<'a, 'b, 'c> {
     pub fn new(vm: &'b TTVM<'a>) -> Self {
         Self { vm, funcs: HashMap::new() }
     }
-    pub fn bind(mut self, symbol: &str, params: &Vec<VMType>, rtype: VMType, func: ExternVMFunc) -> VMResult<Self> { 
+    pub fn bind(mut self, symbol: &str, params: &Vec<VMType>, rtype: VMType, func: ExternVMFunc<'c>) -> VMResult<Self> { 
         self.vm.bind_extern(&mut self.funcs, symbol, params, rtype, func)?;
         Ok(self)
     }
@@ -125,7 +125,7 @@ impl<'a, 'b> TTVMFuncBinder<'a, 'b> {
         self.vm.unbind_extern(&mut self.funcs, symbol);
         self
     }
-    pub fn finish(self) -> VMBoundFuncs {
+    pub fn finish(self) -> VMBoundFuncs<'c> {
         // self.vm.bound_funcs = Box::leak(Box::new(self.funcs)) as *const HashMap<usize,ExternVMFunc> as usize;
         VMBoundFuncs(self.funcs)
     }
@@ -975,7 +975,7 @@ impl<'a> TTVM<'a> {
     /// binds an external function to the specified symbol
     /// 
     /// fails if the specified signature does not match the actual signature of the symbol
-    pub fn bind_extern(&self, bound_funcs: &mut HashMap<usize, ExternVMFunc>, symbol: &str, params: &Vec<VMType>, rtype: VMType, func: ExternVMFunc) -> VMResult<()> {
+    pub fn bind_extern<'b>(&self, bound_funcs: &mut HashMap<usize, ExternVMFunc<'b>>, symbol: &str, params: &Vec<VMType>, rtype: VMType, func: ExternVMFunc<'b>) -> VMResult<()> {
         let mut e = None;
         for i in 0..self.persist.index.len() {
             let ent = &self.persist.index[i];
@@ -1014,7 +1014,7 @@ impl<'a> TTVM<'a> {
     pub async fn execute_async(&mut self, symbol: &str, params: &Vec<VMValue<'_>>, rtype: VMType<'_>, timeout: Option<Duration>) -> VMResult<VMValue> {
         self.bound_execute_async(symbol, params, rtype, timeout, None).await
     }
-    pub async fn bound_execute_async(&mut self, symbol: &str, params: &Vec<VMValue<'_>>, rtype: VMType<'_>, timeout: Option<Duration>, bindings: Option<&VMBoundFuncs>) -> VMResult<VMValue> {
+    pub async fn bound_execute_async<'b>(&mut self, symbol: &str, params: &Vec<VMValue<'_>>, rtype: VMType<'_>, timeout: Option<Duration>, bindings: Option<&VMBoundFuncs<'b>>) -> VMResult<VMValue> {
     //     let empty_map = HashMap::new();
     //     let bf = self.bound_funcs;
     //     let map = if self.bound_funcs==0{empty_map}else{unsafe {mem::take(&mut *(self.bound_funcs.clone() as *mut HashMap<usize, ExternVMFunc>))}};

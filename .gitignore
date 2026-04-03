@@ -2,3 +2,4 @@
 *.ttvm
 *.bin
 *.lock
+/ignored
